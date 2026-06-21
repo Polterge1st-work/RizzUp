@@ -47,8 +47,10 @@ def is_prompt_injection(text: str) -> bool:
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💬 Ответить на сообщение")],
-        [KeyboardButton(text="✏️ Улучшить сообщение")],
-        [KeyboardButton(text="🚀 Начать разговор")],
+        [
+            KeyboardButton(text="✏️ Улучшить сообщение"),
+            KeyboardButton(text="🚀 Начать разговор"),
+        ],
         [KeyboardButton(text="⚙️ Настройки")],
     ],
     resize_keyboard=True,
@@ -323,22 +325,20 @@ async def cmd_start(message: Message):
     user = message.from_user
     await add_user(user.id, user.username, user.first_name)
     await message.answer(
-        "Привет! Я RizzUp 👋\n\n"
-        "Твой личный ассистент в переписках.\n\n"
-        "Вот что я умею:\n\n"
+        f"Привет, {user.first_name}! Я RizzUp 👋\n\n"
+        "Помогаю отвечать в переписках — быстро, естественно и без кринжа.\n\n"
+        "Вот что умею:\n\n"
         "💬 Ответить на сообщение\n"
-        "Скинь мне любое сообщение или скриншот переписки — предложу 3 варианта ответа. Лёгкий, уверенный и с юмором.\n\n"
+        "Скинь текст или скриншот переписки — предложу 3 варианта ответа на выбор.\n\n"
         "✏️ Улучшить сообщение\n"
-        "Написал что-то, но звучит не так? Отправь мне — перепишу в 3 вариантах, выбери тот, который нравится.\n\n"
+        "Написал, но звучит не так? Перепишу в 3 вариантах.\n\n"
         "🚀 Начать разговор\n"
-        "Хочешь написать первым, но не знаешь с чего начать? Опиши ситуацию — придумаю как зайти.\n\n"
-        "Всё просто — выбирай функцию и пробуй 👇",
-        reply_markup=MAIN_MENU
-    )
-    settings = await get_user_settings(user.id)
-    await message.answer(
-        build_settings_text(settings),
-        reply_markup=build_settings_keyboard(settings),
+        "Не знаешь как зайти первым? Опиши ситуацию — придумаю.\n\n"
+        "⚙️ Настройки персонализации\n"
+        "По умолчанию настроено: ты — парень, собеседник — девушка, ответы с маленькой буквы. "
+        "Если у тебя другая ситуация — поменяй в ⚙️ Настройки, это сделает ответы точнее.\n\n"
+        "Выбирай функцию и пробуй 👇",
+        reply_markup=MAIN_MENU,
     )
 
 
@@ -346,18 +346,37 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     """Краткая инструкция по использованию бота."""
     await message.answer(
-        "Как пользоваться RizzUp:\n\n"
-        "1. Скопируй или перешли сообщение, на которое хочешь ответить\n"
-        "2. Отправь его мне\n"
-        "3. Получи 3 варианта ответа: лёгкий, уверенный и с юмором\n\n"
-        "Просто отправь текст — и всё готово."
+        "📖 Как пользоваться RizzUp\n\n"
+        "💬 Ответить на сообщение\n"
+        "Нажми кнопку → отправь текст сообщения или скриншот переписки → получи 3 варианта ответа: лёгкий, уверенный и с юмором. Скопируй который понравился.\n\n"
+        "📎 Добавить контекст\n"
+        "В режиме ответа появляется кнопка «Добавить контекст» — нажми, перешли несколько сообщений из переписки подряд, и бот учтёт всю историю при составлении ответа.\n\n"
+        "✏️ Улучшить сообщение\n"
+        "Нажми кнопку → отправь своё сообщение → получи 3 улучшенные версии.\n\n"
+        "🚀 Начать разговор\n"
+        "Нажми кнопку → опиши кому хочешь написать и при каких обстоятельствах познакомились → получи 3 варианта первого сообщения.\n\n"
+        "⚙️ Настройки\n"
+        "Укажи свой пол, пол собеседника и стиль регистра — бот будет генерировать ответы точнее под твою ситуацию.\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "📸 Скриншоты и контекст переписки — функции Premium.\n"
+        "7 запросов в день бесплатно. Подробнее о тарифах: /premium\n\n"
+        "Если что-то не работает или есть вопрос — напиши нам: @rizzup_support"
     )
 
+@router.message(Command("offer"))
+async def cmd_offer(message: Message):
+    """Реквизиты исполнителя и ссылка на публичную оферту."""
+    await message.answer(
+        "📄 Реквизиты и оферта\n\n"
+        "https://telegra.ph/PUBLICHNAYA-OFERTA-RizzUp-06-20"
+    )
 
 def parse_variants(text: str) -> list[tuple[str, str]] | None:
     """
     Разбирает ответ модели на 3 варианта по эмодзи 1️⃣ 2️⃣ 3️⃣.
-    Возвращает список кортежей (эмодзи, чистый текст) или None если парсинг не удался.
+    Если модель не использовала эмодзи-маркеры (редкий сбой формата на некоторых темах),
+    пробует запасной разбор по обычным цифрам "1." "2." "3." — частый паттерн отклонения формата.
+    Возвращает список кортежей (эмодзи, чистый текст) или None если парсинг не удался вообще.
     """
     markers = ["1️⃣", "2️⃣", "3️⃣"]
     variants = []
@@ -373,6 +392,22 @@ def parse_variants(text: str) -> list[tuple[str, str]] | None:
 
     if len(variants) == 3:
         return variants
+
+    # Запасной разбор — модель иногда сбивается на обычные цифры с точкой
+    fallback_markers = ["1.", "2.", "3."]
+    fallback_variants = []
+    for marker, emoji in zip(fallback_markers, markers):
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(marker):
+                clean = stripped.removeprefix(marker).strip()
+                if clean:
+                    fallback_variants.append((emoji, clean))
+                break
+
+    if len(fallback_variants) == 3:
+        return fallback_variants
+
     return None
 
 
@@ -395,7 +430,8 @@ async def btn_reply(message: Message, state: FSMContext):
     """Переводит пользователя в режим ответа на сообщение."""
     await state.set_state(UserState.replying)
     await message.answer(
-        "Скопируй или перешли сообщение из переписки или скриншот — предложу 3 варианта ответа 📲\n\n",
+        "Отправь сообщение из переписки или скриншот 📲\n\n"
+        "Хочешь чтобы я учёл контекст всей переписки? Нажми «📎 Добавить контекст» и перешли нужные сообщения.",
         reply_markup=REPLY_MODE_MENU,
     )
 
@@ -420,7 +456,10 @@ async def btn_add_context(message: Message, state: FSMContext):
 async def handle_context_text(message: Message, state: FSMContext):
     """Накапливает сообщения контекста и запускает debounce-таймер."""
     if is_prompt_injection(message.text):
-        await message.answer("Пересылай обычные сообщения из переписки 💬")
+        await message.answer(
+        "Перешли сообщения из переписки — одно за другим 📎\n\n"
+        "Максимум 20 сообщений. После паузы в отправке я автоматически составлю ответ с учётом всего контекста.",
+        )
         return
 
     if await is_banned(message.from_user.id):
@@ -456,7 +495,8 @@ async def back_from_context(message: Message, state: FSMContext):
         pending_timers.pop(user_id, None)
     await state.set_state(UserState.replying)
     await message.answer(
-        "Отправь сообщение из переписки или скриншот 📲",
+        "Отправь сообщение из переписки или скриншот 📲\n\n"
+        "Хочешь чтобы я учёл контекст всей переписки? Нажми «📎 Добавить контекст» и перешли нужные сообщения.",
         reply_markup=REPLY_MODE_MENU,
     )
 
@@ -475,7 +515,10 @@ async def btn_improve(message: Message, state: FSMContext):
 async def handle_improve(message: Message, state: FSMContext):
     """Обработка текстового сообщения в режиме UserState.improving."""
     if is_prompt_injection(message.text):
-        await message.answer("Отправь своё сообщение которое хочешь улучшить ✏️")
+        await message.answer(
+        "Отправь своё сообщение которое нужно улучшить — перепишу его в 3 вариантах ✏️",
+        reply_markup=CONTEXT_MODE_MENU,
+    )
         return
 
     # Проверяем бан
@@ -514,8 +557,8 @@ async def btn_start_chat(message: Message, state: FSMContext):
     """Переводит пользователя в режим генерации первого сообщения."""
     await state.set_state(UserState.starting)
     await message.answer(
-        "Опиши ситуацию — кому хочешь написать и при каких обстоятельствах познакомились 🚀\n\n"
-        "Например: хочу написать девушке с которой познакомился вчера на тусовке",
+        "Опиши ситуацию — кому хочешь написать и если нужно, как познакомились 🚀\n\n"
+        "Например: хочу написать девушке с которой познакомился вчера на тусовке. Или: хочу написать подруге с которой давно не общался",
         reply_markup=CONTEXT_MODE_MENU,
     )
 
