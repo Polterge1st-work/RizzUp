@@ -1,12 +1,19 @@
 import os
 import asyncio
 from aiogram import Router, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from ai import get_reply_variants, get_reply_from_screenshot, get_improved_variants, get_start_variants, get_reply_with_context
 from states import UserState
-from database import add_user, log_request, is_banned, is_admin, ban_user, unban_user, get_stats, get_all_users, get_user_settings, set_user_setting
+from database import add_user, log_request, is_banned, is_admin, ban_user, unban_user, get_stats, get_all_users, get_user_settings, set_user_setting, create_payment, mark_payment_paid, get_active_subscribers, get_recent_payments, get_revenue_stats, activate_subscription
+from subscription import check_access, consume_access, get_remaining_free
+from payments import (
+    SUBSCRIPTION_PLANS, PACKAGE_PLANS, ALL_PLANS,
+    is_subscription_plan, build_stars_invoice_params,
+    create_cryptobot_invoice, process_cryptobot_payment_if_paid, apply_paid_plan,
+    create_yookassa_invoice, check_yookassa_payment, process_yookassa_webhook, yookassa_enabled,
+)
 
 dp = None  # будет установлен из main.py
 
@@ -18,6 +25,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 # Хранилища для debounce в режиме контекста
 pending_messages: dict[int, list[str]] = {}
 pending_timers: dict[int, asyncio.Task] = {}
+
+# Хранилище id последнего premium-сообщения для каждого пользователя
+premium_messages: dict[int, int] = {}
 
 
 async def admin_only(message: Message) -> bool:
@@ -51,7 +61,10 @@ MAIN_MENU = ReplyKeyboardMarkup(
             KeyboardButton(text="✏️ Улучшить сообщение"),
             KeyboardButton(text="🚀 Начать разговор"),
         ],
-        [KeyboardButton(text="⚙️ Настройки")],
+        [
+            KeyboardButton(text="⭐ Premium"),
+            KeyboardButton(text="⚙️ Настройки"),
+        ],
     ],
     resize_keyboard=True,
 )
@@ -132,6 +145,69 @@ def build_field_keyboard(field: str) -> InlineKeyboardMarkup:
     ])
 
 
+# ─── Вспомогательные функции для экранов монетизации ──────────────────────────
+
+def build_plans_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора тарифа — подписки по 2 в ряд, пакеты по 2 в ряд."""
+    sub_items = list(SUBSCRIPTION_PLANS.items())
+    pack_items = list(PACKAGE_PLANS.items())
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="— Подписка Premium —", callback_data="plan:noop")],
+        [
+            InlineKeyboardButton(text=f"{sub_items[0][1]['label']} — {sub_items[0][1]['price_rub']} ₽", callback_data=f"plan:{sub_items[0][0]}"),
+            InlineKeyboardButton(text=f"{sub_items[1][1]['label']} — {sub_items[1][1]['price_rub']} ₽", callback_data=f"plan:{sub_items[1][0]}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"🔥 {sub_items[2][1]['label']} — {sub_items[2][1]['price_rub']} ₽", callback_data=f"plan:{sub_items[2][0]}"),
+        ],
+        [InlineKeyboardButton(text="— Пакеты запросов —", callback_data="plan:noop")],
+        [
+            InlineKeyboardButton(text=f"{pack_items[0][1]['label']} — {pack_items[0][1]['price_rub']} ₽", callback_data=f"plan:{pack_items[0][0]}"),
+            InlineKeyboardButton(text=f"🔥 {pack_items[1][1]['label']} — {pack_items[1][1]['price_rub']} ₽", callback_data=f"plan:{pack_items[1][0]}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"{pack_items[2][1]['label']} — {pack_items[2][1]['price_rub']} ₽", callback_data=f"plan:{pack_items[2][0]}"),
+        ],
+    ])
+
+
+def build_payment_method_keyboard(plan_id: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора способа оплаты для конкретного тарифа."""
+    has_crypto = bool(os.getenv("CRYPTO_BOT_TOKEN"))
+    rows = [
+        [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data=f"pay:stars:{plan_id}")],
+    ]
+    if yookassa_enabled():
+        rows.append([InlineKeyboardButton(text="💳 Банковская карта", callback_data=f"pay:yookassa:{plan_id}")])
+    if has_crypto:
+        rows.append([InlineKeyboardButton(text="💎 CryptoBot (USDT/TON)", callback_data=f"pay:crypto:{plan_id}")])
+    rows.append([InlineKeyboardButton(text="‹ Назад к тарифам", callback_data="plan:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_paywall_text(reason: str) -> str:
+    """Текст paywall в зависимости от причины блокировки."""
+    if reason == "premium_only":
+        return (
+            "Это функция Premium ⭐\n\n"
+            "Ответы по скриншотам и с учётом контекста переписки доступны только по подписке.\n\n"
+            "Подключи Premium чтобы пользоваться без ограничений 👇"
+        )
+    return (
+        "Лимит на сегодня исчерпан 😔\n\n"
+        "7 бесплатных запросов обновятся завтра. Чтобы продолжить прямо сейчас — подключи Premium или купи пакет запросов 👇"
+    )
+
+
+async def _edit_or_replace(callback: CallbackQuery, text: str, reply_markup=None):
+    """Редактирует сообщение независимо от того фото это или текст."""
+    msg = callback.message
+    if msg.photo or msg.document:
+        await msg.edit_caption(caption=text, reply_markup=reply_markup)
+    else:
+        await msg.edit_text(text, reply_markup=reply_markup)
+
+
 @router.message(F.text == "⚙️ Настройки")
 async def btn_settings(message: Message):
     """Открывает экран настроек персонализации."""
@@ -191,6 +267,16 @@ async def process_context(user_id: int, bot, storage):
     if not messages:
         return
 
+    # Проверяем доступ к функции контекста (только по подписке)
+    access = await check_access(user_id, "context")
+    if not access["allowed"]:
+        await bot.send_message(
+            user_id,
+            build_paywall_text(access["reason"]),
+            reply_markup=build_plans_keyboard(),
+        )
+        return
+
     try:
         await bot.send_chat_action(user_id, "typing")
         settings = await get_user_settings(user_id)
@@ -231,6 +317,272 @@ async def _delayed_process(user_id: int, bot, delay: float, storage):
         pass
 
 
+# ─── Монетизация: Premium, тарифы, оплата ─────────────────────────────────────
+
+@router.message(Command("premium"))
+async def cmd_premium(message: Message):
+    """Показывает тарифы Premium. Удаляет предыдущее сообщение если есть."""
+    user_id = message.from_user.id
+
+    if user_id in premium_messages:
+        try:
+            await message.bot.delete_message(message.chat.id, premium_messages[user_id])
+        except Exception:
+            pass
+        del premium_messages[user_id]
+
+    sent = await message.answer(
+        "⭐ RizzUp Premium\n\n"
+        "Открывает все возможности бота без ограничений:\n\n"
+        "💬 Безлимитные ответы — никаких дневных лимитов, пиши сколько хочешь\n"
+        "📸 Ответы по скриншотам — скинь скрин переписки и получи идеальный ответ\n"
+        "🧵 Режим контекста — бот учитывает всю вашу переписку и отвечает точнее\n"
+        "⚡ Мгновенные ответы — никаких задержек и очередей\n\n"
+        "Подписка продлевает доступ, пакеты складываются с остатком.\n\n"
+        "Выбери тариф 👇",
+        reply_markup=build_plans_keyboard(),
+    )
+    premium_messages[user_id] = sent.message_id
+
+
+@router.message(F.text == "⭐ Premium")
+async def btn_premium(message: Message):
+    """Кнопка Premium в главном меню."""
+    await cmd_premium(message)
+
+
+@router.callback_query(F.data == "plan:noop")
+async def plan_noop(callback: CallbackQuery):
+    """Заголовки-разделители в списке тарифов — просто игнорируем нажатие."""
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("plan:"))
+async def select_plan(callback: CallbackQuery):
+    """Пользователь выбрал тариф — показываем выбор способа оплаты."""
+    plan_id = callback.data.removeprefix("plan:")
+
+    if plan_id == "back":
+        await _edit_or_replace(
+            callback,
+            "⭐ RizzUp Premium\n\nВыбери тариф 👇",
+            reply_markup=build_plans_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    await _edit_or_replace(
+        callback,
+        f"{'📅 Подписка' if is_subscription_plan(plan_id) else '📦 Пакет'}: {plan['label']} — {plan['price_rub']} ₽\n\nВыбери способ оплаты:",
+        reply_markup=build_payment_method_keyboard(plan_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay:stars:"))
+async def pay_with_stars(callback: CallbackQuery):
+    """Создаёт инвойс на оплату через Telegram Stars."""
+    plan_id = callback.data.removeprefix("pay:stars:")
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    # Убираем кнопки сразу — нельзя создать второй инвойс повторным нажатием
+    await _edit_or_replace(
+        callback,
+        f"{'📅 Подписка' if is_subscription_plan(plan_id) else '📦 Пакет'}: {plan['label']} — {plan['price_rub']} ₽\n\nСчёт выставлен 👇",
+        reply_markup=None,
+    )
+
+    invoice_params = build_stars_invoice_params(plan_id)
+    await callback.message.answer_invoice(
+        title=invoice_params["title"],
+        description=invoice_params["description"],
+        payload=invoice_params["payload"],
+        currency=invoice_params["currency"],
+        prices=invoice_params["prices"],
+    )
+    await callback.answer()
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    """Обязательное подтверждение готовности принять платёж Stars."""
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    """Обрабатывает успешную оплату через Telegram Stars."""
+    payment = message.successful_payment
+    plan_id = payment.invoice_payload
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        return
+
+    payment_id = await create_payment(
+        user_id=message.from_user.id,
+        provider="stars",
+        provider_payment_id=payment.telegram_payment_charge_id,
+        plan=plan_id,
+        amount=payment.total_amount,
+        currency=payment.currency,
+    )
+    await mark_payment_paid(payment_id)
+    await apply_paid_plan(message.from_user.id, plan_id)
+
+    if is_subscription_plan(plan_id):
+        text = f"Готово! Подписка «{plan['label']}» активирована ⭐\n\nТеперь у тебя безлимит на все функции, включая скриншоты и контекст переписки."
+    else:
+        text = f"Готово! Начислено {plan['amount']} запросов 🎉\n\nОни не сгорают — используй когда захочешь."
+
+    await message.answer(text, reply_markup=MAIN_MENU)
+
+
+@router.callback_query(F.data.startswith("pay:crypto:"))
+async def pay_with_crypto(callback: CallbackQuery):
+    """Создаёт инвойс на оплату через CryptoBot и показывает кнопку проверки."""
+    plan_id = callback.data.removeprefix("pay:crypto:")
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    invoice = await create_cryptobot_invoice(plan_id)
+    if not invoice:
+        await callback.answer("Не получилось создать счёт, попробуй ещё раз чуть позже", show_alert=True)
+        return
+
+    await create_payment(
+        user_id=callback.from_user.id,
+        provider="cryptobot",
+        provider_payment_id=invoice["invoice_id"],
+        plan=plan_id,
+        amount=plan["price_rub"],
+        currency="RUB",
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить", url=invoice["pay_url"])],
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"checkpay:{plan_id}:{invoice['invoice_id']}")],
+        [InlineKeyboardButton(text="‹ Назад к тарифам", callback_data="plan:back")],
+    ])
+    await _edit_or_replace(
+        callback,
+        f"{plan['label']} — {plan['price_rub']} ₽\n\nОплати по кнопке ниже, затем нажми «Я оплатил» — проверим автоматически.",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("checkpay:"))
+async def check_crypto_payment(callback: CallbackQuery):
+    """Проверяет оплачен ли инвойс CryptoBot по нажатию «Я оплатил»."""
+    parts = callback.data.split(":")
+    plan_id, invoice_id = parts[1], parts[2]
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    paid = await process_cryptobot_payment_if_paid(callback.from_user.id, plan_id, invoice_id)
+
+    if paid:
+        if is_subscription_plan(plan_id):
+            text = f"Готово! Подписка «{plan['label']}» активирована ⭐\n\nТеперь у тебя безлимит на все функции, включая скриншоты и контекст переписки."
+        else:
+            text = f"Готово! Начислено {plan['amount']} запросов 🎉\n\nОни не сгорают — используй когда захочешь."
+        await _edit_or_replace(callback, text, reply_markup=None)
+        await callback.answer("Оплата подтверждена!")
+    else:
+        await callback.answer("Оплата пока не найдена. Если только что оплатил — подожди немного и нажми ещё раз", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("pay:yookassa:"))
+async def pay_with_yookassa(callback: CallbackQuery):
+    """Создаёт платёж в ЮКасса и показывает кнопку оплаты."""
+    plan_id = callback.data.removeprefix("pay:yookassa:")
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    invoice = await create_yookassa_invoice(callback.from_user.id, plan_id)
+    if not invoice:
+        await callback.answer("Не получилось создать счёт, попробуй ещё раз чуть позже", show_alert=True)
+        return
+
+    await create_payment(
+        user_id=callback.from_user.id,
+        provider="yookassa",
+        provider_payment_id=invoice["payment_id"],
+        plan=plan_id,
+        amount=plan["price_rub"],
+        currency="RUB",
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить картой", url=invoice["pay_url"])],
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"checkpay_yk:{plan_id}:{invoice['payment_id']}")],
+        [InlineKeyboardButton(text="‹ Назад к тарифам", callback_data="plan:back")],
+    ])
+    await _edit_or_replace(
+        callback,
+        (
+            f"{plan['label']} — {plan['price_rub']} ₽\n\n"
+            "Оплати по кнопке ниже банковской картой, затем нажми «Я оплатил» — проверим автоматически."
+        ),
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("checkpay_yk:"))
+async def check_yookassa_payment_handler(callback: CallbackQuery):
+    """Проверяет статус платежа ЮКасса по нажатию «Я оплатил»."""
+    parts = callback.data.split(":")
+    plan_id, payment_id = parts[1], parts[2]
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    # Если уже оплачен через webhook — просто подтверждаем
+    from database import is_payment_already_paid
+    if await is_payment_already_paid("yookassa", payment_id):
+        if is_subscription_plan(plan_id):
+            text = f"Готово! Подписка «{plan['label']}» активирована ⭐\n\nТеперь у тебя безлимит на все функции, включая скриншоты и контекст переписки."
+        else:
+            text = f"Готово! Начислено {plan['amount']} запросов 🎉\n\nОни не сгорают — используй когда захочешь."
+        await _edit_or_replace(callback, text, reply_markup=None)
+        await callback.answer("Оплата подтверждена!")
+        return
+
+    # Проверяем напрямую через API
+    status = await check_yookassa_payment(payment_id)
+    if status == "succeeded":
+        from database import mark_payment_paid_by_provider_id
+        await mark_payment_paid_by_provider_id("yookassa", payment_id)
+        await apply_paid_plan(callback.from_user.id, plan_id)
+        if is_subscription_plan(plan_id):
+            text = f"Готово! Подписка «{plan['label']}» активирована ⭐\n\nТеперь у тебя безлимит на все функции, включая скриншоты и контекст переписки."
+        else:
+            text = f"Готово! Начислено {plan['amount']} запросов 🎉\n\nОни не сгорают — используй когда захочешь."
+        await _edit_or_replace(callback, text, reply_markup=None)
+        await callback.answer("Оплата подтверждена!")
+    elif status == "canceled":
+        await callback.answer("Платёж отменён. Попробуй ещё раз или выбери другой способ оплаты.", show_alert=True)
+    else:
+        await callback.answer("Оплата пока не найдена. Если только что оплатил — подожди немного и нажми ещё раз", show_alert=True)
+
+
+
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
     if not await admin_only(message):
@@ -239,6 +591,9 @@ async def cmd_admin(message: Message):
         "👨‍💼 Панель администратора\n\n"
         "Команды:\n"
         "/stats — статистика бота\n"
+        "/subscribers — активные подписчики\n"
+        "/payments — последние 20 платежей\n"
+        "/give [user_id] [day|week|month] — выдать подписку вручную\n"
         "/ban [user_id] — забанить пользователя\n"
         "/unban [user_id] — разбанить пользователя\n"
         "/broadcast [текст] — рассылка всем пользователям\n"
@@ -250,17 +605,84 @@ async def cmd_stats(message: Message):
     if not await admin_only(message):
         return
     stats = await get_stats()
+    rev = await get_revenue_stats()
     features_text = "\n".join(
         f"  {feature}: {count}" for feature, count in stats["features"]
     ) or "  нет данных"
+    by_provider_text = "\n".join(
+        f"  {p}: {c} платежей" for p, c in rev["by_provider"]
+    ) or "  нет платежей"
     await message.answer(
         f"📊 Статистика RizzUp\n\n"
         f"👥 Всего пользователей: {stats['total_users']}\n"
         f"🆕 Новых сегодня: {stats['new_today']}\n\n"
         f"📨 Запросов сегодня: {stats['requests_today']}\n"
         f"📨 Запросов за неделю: {stats['requests_week']}\n\n"
-        f"🔥 Популярность функций:\n{features_text}"
+        f"🔥 Популярность функций:\n{features_text}\n\n"
+        f"💳 Монетизация:\n"
+        f"  Активных подписчиков: {rev['active_subs']}\n"
+        f"  Выручка сегодня: {rev['revenue_today']:.0f} ₽\n"
+        f"  Выручка за неделю: {rev['revenue_week']:.0f} ₽\n"
+        f"  Выручка за месяц: {rev['revenue_month']:.0f} ₽\n\n"
+        f"📦 По провайдерам:\n{by_provider_text}"
     )
+
+
+@router.message(Command("subscribers"))
+async def cmd_subscribers(message: Message):
+    """Список активных подписчиков."""
+    if not await admin_only(message):
+        return
+    subs = await get_active_subscribers()
+    if not subs:
+        await message.answer("📋 Активных подписчиков нет")
+        return
+    lines = []
+    for user_id, username, first_name, expires in subs:
+        name = f"@{username}" if username else first_name or str(user_id)
+        lines.append(f"• {name} (id: {user_id})\n  до {expires}")
+    await message.answer(f"📋 Активные подписчики ({len(subs)}):\n\n" + "\n\n".join(lines))
+
+
+@router.message(Command("payments"))
+async def cmd_payments(message: Message):
+    """Последние 20 оплаченных платежей."""
+    if not await admin_only(message):
+        return
+    payments = await get_recent_payments(20)
+    if not payments:
+        await message.answer("💳 Платежей ещё нет")
+        return
+    lines = []
+    for row in payments:
+        pid, user_id, username, first_name, provider, plan, amount, currency, status, created_at = row
+        name = f"@{username}" if username else first_name or str(user_id)
+        lines.append(f"• {name} — {plan} — {amount} {currency} — {provider}\n  {created_at[:16]}")
+    await message.answer("💳 Последние платежи:\n\n" + "\n\n".join(lines))
+
+
+@router.message(Command("give"))
+async def cmd_give(message: Message):
+    """Выдать подписку вручную: /give [user_id] [day|week|month]."""
+    if not await admin_only(message):
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer("Использование: /give [user_id] [day|week|month]")
+        return
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("Неверный user_id")
+        return
+    period = args[2].lower()
+    days_map = {"day": 1, "week": 7, "month": 30}
+    days = days_map.get(period)
+    if not days:
+        await message.answer("Неверный период. Используй: day, week, month")
+        return
+    await activate_subscription(user_id, days)
+    await message.answer(f"✅ Пользователю {user_id} выдана подписка на {days} дн.")
 
 
 @router.message(Command("ban"))
@@ -363,6 +785,7 @@ async def cmd_help(message: Message):
         "Если что-то не работает или есть вопрос — напиши нам: @rizzup_support"
     )
 
+
 @router.message(Command("offer"))
 async def cmd_offer(message: Message):
     """Реквизиты исполнителя и ссылка на публичную оферту."""
@@ -370,6 +793,7 @@ async def cmd_offer(message: Message):
         "📄 Реквизиты и оферта\n\n"
         "https://telegra.ph/PUBLICHNAYA-OFERTA-RizzUp-06-20"
     )
+
 
 def parse_variants(text: str) -> list[tuple[str, str]] | None:
     """
@@ -384,7 +808,6 @@ def parse_variants(text: str) -> list[tuple[str, str]] | None:
     for marker in markers:
         for line in text.splitlines():
             if line.startswith(marker):
-                # Отделяем эмодзи от текста варианта
                 clean = line.removeprefix(marker).strip()
                 if clean:
                     variants.append((marker, clean))
@@ -440,7 +863,6 @@ async def btn_reply(message: Message, state: FSMContext):
 async def btn_add_context(message: Message, state: FSMContext):
     """Переводит пользователя в режим накопления контекста переписки."""
     await state.set_state(UserState.replying_context)
-    # Очищаем накопленные сообщения и таймеры если остались от прошлого раза
     user_id = message.from_user.id
     pending_messages.pop(user_id, None)
     if user_id in pending_timers:
@@ -457,8 +879,8 @@ async def handle_context_text(message: Message, state: FSMContext):
     """Накапливает сообщения контекста и запускает debounce-таймер."""
     if is_prompt_injection(message.text):
         await message.answer(
-        "Перешли сообщения из переписки — одно за другим 📎\n\n"
-        "Максимум 20 сообщений. После паузы в отправке я автоматически составлю ответ с учётом всего контекста.",
+            "Перешли сообщения из переписки — одно за другим 📎\n\n"
+            "Максимум 20 сообщений. После паузы в отправке я автоматически составлю ответ с учётом всего контекста.",
         )
         return
 
@@ -470,18 +892,15 @@ async def handle_context_text(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
 
-    # Накапливаем сообщение в список
     if user_id not in pending_messages:
         pending_messages[user_id] = []
     pending_messages[user_id].append(message.text)
 
-    # Отменяем предыдущий таймер если есть
     if user_id in pending_timers:
         pending_timers[user_id].cancel()
 
-    # Запускаем новый таймер 1.5 секунды — после паузы обрабатываем накопленное
     pending_timers[user_id] = asyncio.create_task(
-    _delayed_process(user_id, message.bot, 1.5, dp.storage)
+        _delayed_process(user_id, message.bot, 1.5, dp.storage)
     )
 
 
@@ -516,36 +935,34 @@ async def handle_improve(message: Message, state: FSMContext):
     """Обработка текстового сообщения в режиме UserState.improving."""
     if is_prompt_injection(message.text):
         await message.answer(
-        "Отправь своё сообщение которое нужно улучшить — перепишу его в 3 вариантах ✏️",
-        reply_markup=CONTEXT_MODE_MENU,
-    )
+            "Отправь своё сообщение которое нужно улучшить — перепишу его в 3 вариантах ✏️",
+            reply_markup=CONTEXT_MODE_MENU,
+        )
         return
 
-    # Проверяем бан
     if await is_banned(message.from_user.id):
         await message.answer("Вы заблокированы.")
         return
-    # Логируем запрос
-    await log_request(message.from_user.id, "improve")
 
-    # Показываем индикатор печати, пока AI думает
+    access = await check_access(message.from_user.id, "text")
+    if not access["allowed"]:
+        await message.answer(build_paywall_text(access["reason"]), reply_markup=build_plans_keyboard())
+        return
+
+    await log_request(message.from_user.id, "improve")
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     try:
         settings = await get_user_settings(message.from_user.id)
         reply = await get_improved_variants(message.text, settings)
+        await consume_access(message.from_user.id, access["via"])
 
-        # Парсим ответ на три варианта
         variants = parse_variants(reply)
         if variants:
             case_style = settings.get("case_style", "lower") if settings else "lower"
             variants = [(marker, apply_case_style(text, case_style)) for marker, text in variants]
-            await message.answer(
-                format_variants(variants),
-                parse_mode="Markdown",
-            )
+            await message.answer(format_variants(variants), parse_mode="Markdown")
         else:
-            # Если парсинг не удался — отправляем оригинальный текст
             await message.answer(reply)
 
     except Exception:
@@ -570,29 +987,28 @@ async def handle_start(message: Message, state: FSMContext):
         await message.answer("Опиши ситуацию обычным текстом 🚀")
         return
 
-    # Проверяем бан
     if await is_banned(message.from_user.id):
         await message.answer("Вы заблокированы.")
         return
-    # Логируем запрос
-    await log_request(message.from_user.id, "start")
 
-    # Показываем индикатор печати, пока AI думает
+    access = await check_access(message.from_user.id, "text")
+    if not access["allowed"]:
+        await message.answer(build_paywall_text(access["reason"]), reply_markup=build_plans_keyboard())
+        return
+
+    await log_request(message.from_user.id, "start")
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     try:
         settings = await get_user_settings(message.from_user.id)
         reply = await get_start_variants(message.text, settings)
+        await consume_access(message.from_user.id, access["via"])
 
-        # Парсим ответ на три варианта
         variants = parse_variants(reply)
         if variants:
             case_style = settings.get("case_style", "lower") if settings else "lower"
             variants = [(marker, apply_case_style(text, case_style)) for marker, text in variants]
-            await message.answer(
-                format_variants(variants),
-                parse_mode="Markdown",
-            )
+            await message.answer(format_variants(variants), parse_mode="Markdown")
         else:
             await message.answer(reply)
 
@@ -607,68 +1023,62 @@ async def handle_text(message: Message, state: FSMContext):
         await message.answer("Отправь мне обычное сообщение из переписки 💬")
         return
 
-    # Проверяем бан
     if await is_banned(message.from_user.id):
         await message.answer("Вы заблокированы.")
         return
-    # Логируем запрос
-    await log_request(message.from_user.id, "reply")
 
-    # Показываем индикатор печати, пока AI думает
+    access = await check_access(message.from_user.id, "text")
+    if not access["allowed"]:
+        await message.answer(build_paywall_text(access["reason"]), reply_markup=build_plans_keyboard())
+        return
+
+    await log_request(message.from_user.id, "reply")
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     try:
         settings = await get_user_settings(message.from_user.id)
         reply = await get_reply_variants(message.text, settings)
+        await consume_access(message.from_user.id, access["via"])
 
-        # Парсим ответ на три варианта
         variants = parse_variants(reply)
         if variants:
             case_style = settings.get("case_style", "lower") if settings else "lower"
             variants = [(marker, apply_case_style(text, case_style)) for marker, text in variants]
-            await message.answer(
-                format_variants(variants),
-                parse_mode="Markdown",
-            )
+            await message.answer(format_variants(variants), parse_mode="Markdown")
         else:
-            # Если парсинг не удался — отправляем оригинальный текст
             await message.answer(reply)
 
     except Exception:
-        # Сообщаем пользователю об ошибке понятным языком
         await message.answer("Что-то пошло не так, попробуй ещё раз 🙁")
 
 
 @router.message(F.photo, UserState.replying)
 async def handle_photo(message: Message, state: FSMContext):
     """Обработка скриншота переписки отправленного как фото."""
-    # Показываем индикатор печати, пока AI анализирует скриншот
-    await message.bot.send_chat_action(message.chat.id, "typing")
-
-    # Проверяем бан
     if await is_banned(message.from_user.id):
         await message.answer("Вы заблокированы.")
         return
-    # Логируем запрос
+
+    access = await check_access(message.from_user.id, "screenshot")
+    if not access["allowed"]:
+        await message.answer(build_paywall_text(access["reason"]), reply_markup=build_plans_keyboard())
+        return
+
     await log_request(message.from_user.id, "screenshot")
+    await message.bot.send_chat_action(message.chat.id, "typing")
 
     try:
-        # Берём фото наилучшего качества (последний элемент — самое большое)
         photo = message.photo[-1]
         image_bytes = await message.bot.download(photo.file_id)
 
         settings = await get_user_settings(message.from_user.id)
         reply = await get_reply_from_screenshot(image_bytes.read(), settings)
 
-        # Парсим и форматируем ответ так же как в handle_text
         variants = parse_variants(reply)
         if variants:
             case_style = settings.get("case_style", "lower") if settings else "lower"
             variants = [(marker, apply_case_style(text, case_style)) for marker, text in variants]
-            await message.answer(
-                format_variants(variants),
-                parse_mode="Markdown",
-            )
+            await message.answer(format_variants(variants), parse_mode="Markdown")
         else:
             await message.answer(reply)
 
@@ -679,12 +1089,20 @@ async def handle_photo(message: Message, state: FSMContext):
 @router.message(F.document, UserState.replying)
 async def handle_document(message: Message, state: FSMContext):
     """Обработка скриншота переписки отправленного как документ (файл)."""
-    # Проверяем что документ является изображением
     if not message.document.mime_type.startswith("image/"):
         await message.answer("Отправь скриншот переписки как фото 📸")
         return
 
-    # Показываем индикатор печати, пока AI анализирует скриншот
+    if await is_banned(message.from_user.id):
+        await message.answer("Вы заблокированы.")
+        return
+
+    access = await check_access(message.from_user.id, "screenshot")
+    if not access["allowed"]:
+        await message.answer(build_paywall_text(access["reason"]), reply_markup=build_plans_keyboard())
+        return
+
+    await log_request(message.from_user.id, "screenshot")
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     try:
@@ -693,15 +1111,11 @@ async def handle_document(message: Message, state: FSMContext):
         settings = await get_user_settings(message.from_user.id)
         reply = await get_reply_from_screenshot(image_bytes.read(), settings)
 
-        # Парсим и форматируем ответ так же как в handle_text
         variants = parse_variants(reply)
         if variants:
             case_style = settings.get("case_style", "lower") if settings else "lower"
             variants = [(marker, apply_case_style(text, case_style)) for marker, text in variants]
-            await message.answer(
-                format_variants(variants),
-                parse_mode="Markdown",
-            )
+            await message.answer(format_variants(variants), parse_mode="Markdown")
         else:
             await message.answer(reply)
 

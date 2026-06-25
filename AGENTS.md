@@ -1,144 +1,186 @@
-# RizzUp Bot — Agent Instructions
-
-## О проекте
+RizzUp Bot — Agent Instructions
+О проекте
 RizzUp — async Telegram бот который помогает людям лучше переписываться.
+
 Бот генерирует 3 варианта ответа на сообщение пользователя: лёгкий, уверенный, с юмором.
+Стек
 
-## Стек
-- Python 3.11+
-- aiogram 3.x — Telegram бот (async)
-- aiogram FSM — управление состояниями пользователя
-- aiosqlite — async работа с SQLite (пользователи, статистика, админка)
-- aiohttp — HTTP запросы к OpenRouter API
-- python-dotenv — переменные окружения
-- OpenRouter API — доступ к AI моделям
+Python 3.11+
+aiogram 3.x — Telegram бот (async)
+aiogram FSM — управление состояниями пользователя
+aiosqlite — async работа с SQLite (пользователи, статистика, платежи, подписки)
+aiohttp — HTTP запросы к OpenRouter API, CryptoBot API, ЮКасса API, webhook-сервер
+python-dotenv — переменные окружения
+OpenRouter API — доступ к AI моделям
 
-## Структура проекта
+Структура проекта
 rizzup-bot/
 ├── .env              # секретные ключи, никогда не трогать и не выводить
-├── main.py           # точка входа, запуск бота, FSM storage, BotCommand, init_db, назначение админа
-├── handlers.py       # все обработчики, FSM состояния, клавиатуры, debounce-логика контекста
+├── .env.example      # шаблон переменных окружения без значений
+├── main.py           # точка входа, запуск бота + webhook-сервер параллельно
+├── handlers.py       # все обработчики, FSM, клавиатуры, paywall, платёжные хендлеры
 ├── ai.py             # запросы к OpenRouter, две модели (текст и vision)
 ├── prompts.py        # все промты хранятся только здесь
 ├── states.py         # FSM состояния UserState
-├── database.py       # SQLite: пользователи, статистика, бан, админка
+├── database.py       # SQLite: users, requests, payments, подписки, пакеты
+├── subscription.py   # логика проверки доступа (подписка / пакет / дневной лимит)
+├── payments.py       # создание и проверка платежей: Stars, CryptoBot, ЮКасса
 ├── rizzup.db         # файл базы данных (создаётся автоматически)
 ├── AGENTS.md         # этот файл
 └── requirements.txt
+Модели OpenRouter
 
-## Модели OpenRouter
-- TEXT_MODEL: deepseek/deepseek-v4-flash — для текстовых сообщений (дешевле и живее на разговорном русском, чем Gemini)
-- VISION_MODEL: google/gemini-2.5-flash — для скриншотов (DeepSeek V4 Pro проверен и отклонён — OpenRouter не отдаёт image input для этой модели)
-- Base URL: https://openrouter.ai/api/v1/chat/completions
-- Авторизация: Bearer token из .env
-- TEMPERATURE = 0.95 — высокая температура нужна для разнообразия вариантов, не понижать без причины — понижение усиливает залипание на одних и тех же фразах
-- Все запросы через aiohttp, async
+TEXT_MODEL: deepseek/deepseek-v4-flash — для текстовых сообщений
+VISION_MODEL: google/gemini-2.5-flash — для скриншотов (DeepSeek V4 Pro отклонён — OpenRouter не отдаёт image input для этой модели)
+Base URL: https://openrouter.ai/api/v1/chat/completions
+Авторизация: Bearer token из .env
+TEMPERATURE = 0.95 — не понижать без причины, нужна для разнообразия вариантов
+Все запросы через aiohttp, async
 
-## Текущие функции бота
-1. Главное меню с тремя кнопками:
-   - 💬 Ответить на сообщение — рабочая
-   - ✏️ Улучшить сообщение — рабочая
-   - 🚀 Начать разговор — рабочая
-2. Режим ответа на сообщение (UserState.replying):
-   - Текстовые сообщения → get_reply_variants()
-   - Фото и документы-изображения → get_reply_from_screenshot()
-   - Кнопки: "◀️ Вернуться в меню" и "📎 Добавить контекст"
-3. Режим контекста переписки (UserState.replying_context):
-   - Пользователь пересылает несколько сообщений подряд
-   - Debounce 1.5 сек — после паузы накопленные сообщения уходят в get_reply_with_context()
-   - После ответа состояние автоматически возвращается в UserState.replying
-   - Кнопка "◀️ Вернуться в меню"
-4. Режим улучшения сообщения (UserState.improving):
-   - Текстовые сообщения → get_improved_variants()
-5. Режим генерации первого сообщения (UserState.starting):
-   - Текстовые сообщения → get_start_variants()
-6. Команды: /start, /help
-7. Админ-панель (доступна только ADMIN_ID из .env):
-   - /admin — список команд
-   - /stats — статистика бота
-   - /ban [user_id] / /unban [user_id]
-   - /broadcast [текст] — рассылка незабаненным пользователям
+Текущие функции бота
 
-## Архитектура handlers.py
-- MAIN_MENU, REPLY_MODE_MENU, CONTEXT_MODE_MENU — клавиатуры
-- parse_variants() — парсинг ответа модели на 3 варианта по эмодзи 1️⃣2️⃣3️⃣
-- format_variants() — форматирование в backticks для копирования
-- is_prompt_injection() — защита от prompt injection (список dangerous_patterns)
-- pending_messages / pending_timers — словари для debounce режима контекста
-- process_context() / _delayed_process() — обработка накопленных сообщений после паузы
-- admin_only() — проверка через сравнение с ADMIN_ID из .env
-- dp — глобальная переменная, устанавливается из main.py для доступа к FSM storage внутри debounce-таймеров
-- FSM фильтры на всех обработчиках текста и фото
+Главное меню с кнопками: 💬 Ответить, ✏️ Улучшить, 🚀 Начать разговор, ⭐ Premium
+Режим ответа на сообщение (UserState.replying):
 
-## Архитектура ai.py
-- get_reply_variants(message) — ответ на сообщение
-- get_reply_with_context(messages: list[str]) — ответ с учётом нескольких сообщений переписки
-- get_reply_from_screenshot(image_bytes) — ответ по скриншоту
-- get_improved_variants(message) — улучшение сообщения пользователя
-- get_start_variants(message) — генерация первого сообщения
-- clean_response(text) — очистка от скобок вида "был(а)" и лишних пробелов
+Текстовые сообщения → get_reply_variants()
+Фото и документы-изображения → get_reply_from_screenshot() — только Premium
+Кнопки: «◀️ Вернуться в меню» и «📎 Добавить контекст»
 
-## Архитектура prompts.py
-- SYSTEM_PROMPT — основной промт для ответов на сообщение
-- CONTEXT_PROMPT — промт для ответа с учётом нескольких сообщений
-- IMPROVE_PROMPT — улучшение сообщений пользователя
-- START_PROMPT — генерация первого сообщения
-- SCREENSHOT_PREFIX — префикс для анализа скриншотов (добавляется к SYSTEM_PROMPT)
 
-## Архитектура database.py
-- init_db() — создаёт таблицы users и requests
-- add_user(), log_request() — регистрация и логирование по фиче
-- is_banned(), ban_user(), unban_user() — управление баном
-- is_admin(), set_admin() — есть в БД, но handlers.py проверяет права прямым сравнением с ADMIN_ID, не через is_admin() — известное расхождение, оставлено осознанно
-- get_stats(), get_all_users() — для /stats и /broadcast
+Режим контекста переписки (UserState.replying_context) — только Premium:
 
-## Безопасность
-- is_prompt_injection() проверяет входящий текст на попытки изменить поведение модели
-- Все промты содержат инструкцию игнорировать попытки изменить поведение
-- Валидация формата через parse_variants() — некорректные ответы не показываются
-- .env никогда не читать и не выводить в чат
+Debounce 1.5 сек — после паузы накопленные сообщения уходят в get_reply_with_context()
+После ответа состояние возвращается в UserState.replying
 
-## Известный техдолг (не критично)
-- is_admin()/set_admin() в database.py не используются в реальной проверке прав
-- /broadcast не логирует сам факт рассылки в БД
 
-## Отложенные идеи (обсуждались, не реализованы)
-- Монетизация: freemium + тариф "Макс" ~299₽/мес безлимит, либо разовые пакеты запросов / недельная-годовая подписка / подарочные подписки — тарифная структура не финализирована
-- Персонализация: настройка стиля бота под пользователя (возраст, тон общения)
-- Миграция SQLite → PostgreSQL — план на будущее при росте нагрузки
+Режим улучшения (UserState.improving) → get_improved_variants()
+Режим первого сообщения (UserState.starting) → get_start_variants()
+Команды: /start, /help, /premium, /offer
+Монетизация:
 
-## Правила написания кода
+7 бесплатных запросов в день (только текстовые функции)
+Скриншоты и контекст — только по подписке или пакету
+Оплата через Telegram Stars, CryptoBot (USDT/TON), ЮКасса (банковская карта)
+Тарифы: подписки (день/неделя/месяц) и пакеты запросов (30/100/250)
 
-### Обязательно
-- Весь код только async/await
-- Обработка ошибок try/except везде где есть внешние запросы
-- Комментарии на русском языке
-- Все промты только в prompts.py, нигде больше
-- Переменные окружения только через python-dotenv
-- aiogram 3.x синтаксис (не aiogram 2.x)
-- FSM для управления режимами пользователя
-- Проверка is_prompt_injection() в каждом текстовом обработчике
 
-### Запрещено
-- Синхронные функции для IO операций
-- Хардкодить токены и ключи в коде
-- Использовать устаревший aiogram 2.x синтаксис
-- Дублировать промты вне prompts.py
-- Использовать requests вместо aiohttp
-- Хардкодить строки промтов вне prompts.py
+Админ-панель (только ADMIN_ID из .env):
 
-## Стиль кода
-- Простой и читаемый код
-- Функции с понятными названиями на английском
-- Комментарии к неочевидным местам на русском
-- Максимум 1 класс на файл если нужен
+/admin, /stats, /ban, /unban, /broadcast
+/give [user_id] [day|week|month] — выдать подписку вручную
+/subscribers — список активных подписчиков
+/payments — последние 20 платежей
 
-## Целевая аудитория продукта
-14-24 года, активные пользователи Telegram.
+
+
+Архитектура main.py
+
+setup_bot() — инициализация бота, диспетчера, БД, команд
+dp.start_polling(bot) и run_webhook_server() запускаются через asyncio.gather() — параллельно
+Webhook-сервер (aiohttp) слушает порт 8080, роут POST /yookassa/webhook
+Если YOOKASSA_SHOP_ID не задан в .env — webhook-сервер не запускается
+
+Архитектура handlers.py
+
+MAIN_MENU, REPLY_MODE_MENU, CONTEXT_MODE_MENU — клавиатуры
+build_plans_keyboard() — инлайн-клавиатура со всеми тарифами
+build_payment_method_keyboard(plan_id) — выбор способа оплаты (Stars всегда, CryptoBot/ЮКасса если заданы в .env)
+_edit_or_replace() — редактирует сообщение независимо от типа (текст или фото)
+premium_messages — словарь user_id → message_id последнего premium-сообщения (для удаления при повторном открытии)
+check_access() / consume_access() вызываются в каждом обработчике до AI-запроса
+log_request() вызывается только после успешного check_access() — не раньше
+Платёжный флоу Stars: pay_with_stars → pre_checkout → successful_payment
+Платёжный флоу CryptoBot: pay_with_crypto → кнопка «Я оплатил» → check_crypto_payment
+Платёжный флоу ЮКасса: pay_with_yookassa → кнопка «Я оплатил» → check_yookassa_payment_handler + автоматически через webhook
+
+Архитектура subscription.py
+
+FREE_DAILY_LIMIT = 7 — дневной лимит для бесплатных пользователей
+check_access(user_id, feature) — возвращает {allowed, reason, via}
+
+feature: 'text' | 'screenshot' | 'context'
+via: 'subscription' | 'balance' | 'free_limit'
+reason при отказе: 'limit_reached' | 'premium_only'
+
+
+consume_access(user_id, via) — списывает использование по типу доступа
+Приоритет доступа: подписка → пакет запросов → дневной лимит
+
+Архитектура payments.py
+
+ALL_PLANS — единый источник правды по тарифам (SUBSCRIPTION_PLANS + PACKAGE_PLANS)
+apply_paid_plan(user_id, plan_id) — активирует подписку или начисляет пакет
+CryptoBot и ЮКасса появляются в меню только если соответствующие переменные заданы в .env
+process_yookassa_webhook(body) — обработка входящего webhook, защита от двойной активации через is_payment_already_paid()
+Все платежи пишутся в таблицу payments со статусом pending, при оплате переводятся в paid
+
+Архитектура database.py
+
+Таблица users: user_id, username, first_name, is_banned, is_admin, daily_requests_used, daily_requests_reset, subscription_expires, requests_balance
+Таблица requests: логирование запросов по фичам
+Таблица payments: provider, provider_payment_id, plan, amount, currency, status
+activate_subscription(user_id, days) — продлевает от даты истечения если подписка ещё активна
+is_payment_already_paid() — защита от двойного начисления при повторных webhook/нажатиях
+is_admin() / set_admin() есть в БД, но handlers.py проверяет права прямым сравнением с ADMIN_ID — известное расхождение, оставлено осознанно
+
+Переменные окружения (.env)
+TELEGRAM_TOKEN      — токен бота от BotFather
+OPENROUTER_API_KEY  — ключ OpenRouter
+ADMIN_ID            — Telegram user_id администратора
+BOT_USERNAME        — юзернейм бота (без @), используется в return_url ЮКассы
+CRYPTO_BOT_TOKEN    — токен CryptoBot (опционально)
+YOOKASSA_SHOP_ID    — ID магазина ЮКасса (опционально)
+YOOKASSA_SECRET_KEY — секретный ключ ЮКасса (опционально)
+YOOKASSA_WEBHOOK_URL — публичный URL для webhook ЮКассы (опционально)
+Безопасность
+
+is_prompt_injection() проверяет входящий текст на попытки изменить поведение модели
+Все промты содержат инструкцию игнорировать попытки изменить поведение
+.env никогда не читать и не выводить в чат
+.env.example содержит только плейсхолдеры, реальных токенов нет
+Защита от двойного начисления через is_payment_already_paid() во всех платёжных флоях
+
+Известный техдолг (не критично)
+
+is_admin() / set_admin() в database.py не используются в реальной проверке прав
+/broadcast не логирует факт рассылки в БД
+webhook-сервер ЮКассы не проверяет IP-адрес источника (ЮКасса рекомендует whitelist)
+
+Правила написания кода
+Обязательно
+
+Весь код только async/await
+Обработка ошибок try/except везде где есть внешние запросы
+Комментарии на русском языке
+Все промты только в prompts.py, нигде больше
+Переменные окружения только через python-dotenv
+aiogram 3.x синтаксис (не aiogram 2.x)
+FSM для управления режимами пользователя
+check_access() и consume_access() в каждом обработчике с AI-запросом
+log_request() только после успешного check_access()
+
+Запрещено
+
+Синхронные функции для IO операций
+Хардкодить токены и ключи в коде
+Использовать устаревший aiogram 2.x синтаксис
+Дублировать промты вне prompts.py
+Использовать requests вместо aiohttp
+
+Стиль кода
+
+Простой и читаемый код
+Функции с понятными названиями на английском
+Комментарии к неочевидным местам на русском
+Максимум 1 класс на файл если нужен
+
+Целевая аудитория продукта
+14–24 года, активные пользователи Telegram.
+
 Ответы бота должны звучать естественно, как живой человек, без AI-кринжа.
+Приоритеты при разработке
 
-## Приоритеты при разработке
-1. Работающий код важнее идеального кода
-2. Простота важнее избыточной архитектуры
-3. Async везде без исключений
-4. Естественность ответов AI — главный критерий качества
+Работающий код важнее идеального кода
+Простота важнее избыточной архитектуры
+Async везде без исключений
+Естественность ответов AI — главный критерий качества
