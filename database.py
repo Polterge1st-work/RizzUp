@@ -26,8 +26,7 @@ async def init_db():
     """Инициализация пула соединений и создание таблиц если их нет."""
     global _pool
 
-    # Убираем sslmode из URL — asyncpg не понимает этот параметр,
-    # SSL передаём отдельно через ssl="require"
+    import socket
     url = DATABASE_URL.replace("?sslmode=require", "").replace("&sslmode=require", "")
 
     _pool = await asyncpg.create_pool(

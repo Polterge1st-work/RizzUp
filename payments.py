@@ -1,10 +1,9 @@
 """
-Логика создания и проверки платежей через Telegram Stars, CryptoBot и ЮКасса.
+Логика создания и проверки платежей через CryptoBot и ЮКасса.
 """
 import os
 import uuid
 import aiohttp
-from aiogram.types import LabeledPrice
 from database import (
     create_payment, mark_payment_paid,
     mark_payment_paid_by_provider_id, is_payment_already_paid,
@@ -46,20 +45,6 @@ async def apply_paid_plan(user_id: int, plan_id: str):
         await activate_subscription(user_id, SUBSCRIPTION_PLANS[plan_id]["days"])
     elif plan_id in PACKAGE_PLANS:
         await add_requests_balance(user_id, PACKAGE_PLANS[plan_id]["amount"])
-
-
-# ─── Telegram Stars ────────────────────────────────────────────────────────────
-
-def build_stars_invoice_params(plan_id: str) -> dict:
-    """Параметры для answer_invoice() при оплате через Telegram Stars."""
-    plan = ALL_PLANS[plan_id]
-    return {
-        "title": f"RizzUp — {plan['label']}",
-        "description": "Подписка Premium" if is_subscription_plan(plan_id) else "Пакет запросов",
-        "payload": plan_id,
-        "currency": "XTR",
-        "prices": [LabeledPrice(label=plan["label"], amount=plan["price_stars"])],
-    }
 
 
 # ─── CryptoBot ─────────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import os
 import asyncio
 from aiogram import Router, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LabeledPrice, PreCheckoutQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from ai import get_reply_variants, get_reply_from_screenshot, get_improved_variants, get_start_variants, get_reply_with_context
@@ -10,7 +10,7 @@ from database import add_user, log_request, is_banned, is_admin, ban_user, unban
 from subscription import check_access, consume_access, get_remaining_free
 from payments import (
     SUBSCRIPTION_PLANS, PACKAGE_PLANS, ALL_PLANS,
-    is_subscription_plan, build_stars_invoice_params,
+    is_subscription_plan,
     create_cryptobot_invoice, process_cryptobot_payment_if_paid, apply_paid_plan,
     create_yookassa_invoice, check_yookassa_payment, process_yookassa_webhook, yookassa_enabled,
 )
@@ -174,9 +174,7 @@ def build_plans_keyboard() -> InlineKeyboardMarkup:
 def build_payment_method_keyboard(plan_id: str) -> InlineKeyboardMarkup:
     """Клавиатура выбора способа оплаты для конкретного тарифа."""
     has_crypto = bool(os.getenv("CRYPTO_BOT_TOKEN"))
-    rows = [
-        [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data=f"pay:stars:{plan_id}")],
-    ]
+    rows = []
     if yookassa_enabled():
         rows.append([InlineKeyboardButton(text="💳 Банковская карта", callback_data=f"pay:yookassa:{plan_id}")])
     if has_crypto:
@@ -382,67 +380,6 @@ async def select_plan(callback: CallbackQuery):
         reply_markup=build_payment_method_keyboard(plan_id),
     )
     await callback.answer()
-
-
-@router.callback_query(F.data.startswith("pay:stars:"))
-async def pay_with_stars(callback: CallbackQuery):
-    """Создаёт инвойс на оплату через Telegram Stars."""
-    plan_id = callback.data.removeprefix("pay:stars:")
-    plan = ALL_PLANS.get(plan_id)
-    if not plan:
-        await callback.answer("Тариф не найден", show_alert=True)
-        return
-
-    # Убираем кнопки сразу — нельзя создать второй инвойс повторным нажатием
-    await _edit_or_replace(
-        callback,
-        f"{'📅 Подписка' if is_subscription_plan(plan_id) else '📦 Пакет'}: {plan['label']} — {plan['price_rub']} ₽\n\nСчёт выставлен 👇",
-        reply_markup=None,
-    )
-
-    invoice_params = build_stars_invoice_params(plan_id)
-    await callback.message.answer_invoice(
-        title=invoice_params["title"],
-        description=invoice_params["description"],
-        payload=invoice_params["payload"],
-        currency=invoice_params["currency"],
-        prices=invoice_params["prices"],
-    )
-    await callback.answer()
-
-
-@router.pre_checkout_query()
-async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    """Обязательное подтверждение готовности принять платёж Stars."""
-    await pre_checkout_query.answer(ok=True)
-
-
-@router.message(F.successful_payment)
-async def process_successful_payment(message: Message):
-    """Обрабатывает успешную оплату через Telegram Stars."""
-    payment = message.successful_payment
-    plan_id = payment.invoice_payload
-    plan = ALL_PLANS.get(plan_id)
-    if not plan:
-        return
-
-    payment_id = await create_payment(
-        user_id=message.from_user.id,
-        provider="stars",
-        provider_payment_id=payment.telegram_payment_charge_id,
-        plan=plan_id,
-        amount=payment.total_amount,
-        currency=payment.currency,
-    )
-    await mark_payment_paid(payment_id)
-    await apply_paid_plan(message.from_user.id, plan_id)
-
-    if is_subscription_plan(plan_id):
-        text = f"Готово! Подписка «{plan['label']}» активирована ⭐\n\nТеперь у тебя безлимит на все функции, включая скриншоты и контекст переписки."
-    else:
-        text = f"Готово! Начислено {plan['amount']} запросов 🎉\n\nОни не сгорают — используй когда захочешь."
-
-    await message.answer(text, reply_markup=MAIN_MENU)
 
 
 @router.callback_query(F.data.startswith("pay:crypto:"))
