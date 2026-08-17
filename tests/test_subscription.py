@@ -1,0 +1,285 @@
+"""
+Тесты логики подписок и доступа.
+
+Используют моки (поддельные объекты БД) — не трогают реальную базу данных.
+Запуск: pytest tests/test_subscription.py -v
+"""
+
+import pytest
+import sys
+import os
+from unittest.mock import AsyncMock, patch
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from subscription import check_access, consume_access, get_remaining_free, FREE_DAILY_LIMIT
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Фикстуры — подготовка моков для каждого теста
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def mock_db():
+    """
+    Создаёт мок пула соединений PostgreSQL.
+    
+    Каждый тест получает свежий мок, поэтому тесты независимы друг от друга.
+    """
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    
+    # Настраиваем контекстный менеджер: async with pool.acquire() as conn:
+    mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+    
+    with patch("subscription.get_pool", return_value=mock_pool):
+        yield mock_conn
+
+
+@pytest.fixture
+def mock_cache():
+    """
+    Мокирует кеш в database.py (там где он реально используется).
+    
+    get_subscription_status вызывает cache.get из модуля database,
+    поэтому патчим database.cache, а не subscription.cache.
+    """
+    with patch("database.cache") as mock:
+        mock.get.return_value = (False, None)  # кеш промах
+        yield mock
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# check_access — проверка доступа к функциям
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCheckAccess:
+    """Тесты проверки доступа: подписка / пакет / бесплатный лимит / блокировка."""
+
+    # ─── Подписка Premium ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_premium_user_can_use_screenshot(self, mock_db, mock_cache):
+        """Подписчик может использовать Premium-функции (скриншоты)."""
+        mock_db.fetchrow.return_value = {
+            "subscription_expires": datetime.now() + timedelta(days=7),
+            "active": True,
+        }
+        
+        result = await check_access(user_id=1, feature="screenshot")
+        
+        assert result["allowed"] is True
+        assert result["via"] == "subscription"
+        assert result["reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_premium_user_can_use_context(self, mock_db, mock_cache):
+        """Подписчик может использовать режим контекста."""
+        mock_db.fetchrow.return_value = {
+            "subscription_expires": datetime.now() + timedelta(days=7),
+            "active": True,
+        }
+        
+        result = await check_access(user_id=1, feature="context")
+        
+        assert result["allowed"] is True
+        assert result["via"] == "subscription"
+
+    @pytest.mark.asyncio
+    async def test_premium_user_can_use_text(self, mock_db, mock_cache):
+        """Подписчик может использовать текстовые функции."""
+        mock_db.fetchrow.return_value = {
+            "subscription_expires": datetime.now() + timedelta(days=7),
+            "active": True,
+        }
+        
+        result = await check_access(user_id=1, feature="text")
+        
+        assert result["allowed"] is True
+        assert result["via"] == "subscription"
+
+    @pytest.mark.asyncio
+    async def test_expired_subscription_not_premium(self, mock_db, mock_cache):
+        """Истёкшая подписка не даёт доступ."""
+        mock_db.fetchrow.return_value = {
+            "subscription_expires": datetime.now() - timedelta(days=1),
+            "active": False,
+        }
+        
+        result = await check_access(user_id=1, feature="screenshot")
+        
+        assert result["allowed"] is False
+        assert result["reason"] == "premium_only"
+
+    # ─── Пакет запросов ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_balance_user_can_use_text(self, mock_db, mock_cache):
+        """Пользователь с пакетом может использовать текстовые функции."""
+        mock_db.fetchrow.return_value = {
+            "subscription_expires": None,
+            "requests_balance": 10,
+        }
+        
+        result = await check_access(user_id=2, feature="text")
+        
+        assert result["allowed"] is True
+        assert result["via"] == "balance"
+
+    @pytest.mark.asyncio
+    async def test_balance_user_blocked_from_screenshots(self, mock_db, mock_cache):
+        """Пакет НЕ даёт доступ к Premium-функциям (скриншоты)."""
+        mock_db.fetchrow.return_value = {
+            "subscription_expires": None,
+            "requests_balance": 10,
+        }
+        
+        result = await check_access(user_id=2, feature="screenshot")
+        
+        assert result["allowed"] is False
+        assert result["reason"] == "premium_only"
+
+    @pytest.mark.asyncio
+    async def test_zero_balance_blocked(self, mock_db, mock_cache):
+        """Баланс 0 — доступ только через бесплатный лимит."""
+        mock_db.fetchrow.return_value = {
+            "subscription_expires": None,
+            "requests_balance": 0,
+        }
+        
+        result = await check_access(user_id=3, feature="text")
+        
+        # Должен перейти к проверке бесплатного лимита
+        assert result["allowed"] is True  # если лимит не исчерпан
+        assert result["via"] == "free_limit"
+
+    # ─── Бесплатный лимит ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_free_user_can_use_text(self, mock_db, mock_cache):
+        """Новый пользователь может использовать текст (в пределах лимита)."""
+        mock_db.fetchrow.side_effect = [
+            {"subscription_expires": None, "requests_balance": 0},  # get_subscription_status
+            {"active": False},  # проверка подписки
+            {"daily_requests_used": 0, "daily_requests_reset": datetime.now().date()},  # _get_daily_usage
+        ]
+        
+        result = await check_access(user_id=4, feature="text")
+        
+        assert result["allowed"] is True
+        assert result["via"] == "free_limit"
+
+    @pytest.mark.asyncio
+    async def test_free_user_blocked_after_limit(self, mock_db, mock_cache):
+        """После исчерпания лимита — блокировка."""
+        mock_db.fetchrow.side_effect = [
+            {"subscription_expires": None, "requests_balance": 0},
+            {"active": False},
+            {"daily_requests_used": FREE_DAILY_LIMIT, "daily_requests_reset": datetime.now().date()},
+        ]
+        
+        result = await check_access(user_id=5, feature="text")
+        
+        assert result["allowed"] is False
+        assert result["reason"] == "limit_reached"
+
+    @pytest.mark.asyncio
+    async def test_free_user_blocked_from_screenshots(self, mock_db, mock_cache):
+        """Бесплатный пользователь НЕ может использовать скриншоты."""
+        mock_db.fetchrow.side_effect = [
+            {"subscription_expires": None, "requests_balance": 0},
+            {"active": False},
+        ]
+        
+        result = await check_access(user_id=6, feature="screenshot")
+        
+        assert result["allowed"] is False
+        assert result["reason"] == "premium_only"
+
+    @pytest.mark.asyncio
+    async def test_free_user_blocked_from_context(self, mock_db, mock_cache):
+        """Бесплатный пользователь НЕ может использовать контекст."""
+        mock_db.fetchrow.side_effect = [
+            {"subscription_expires": None, "requests_balance": 0},
+            {"active": False},
+        ]
+        
+        result = await check_access(user_id=7, feature="context")
+        
+        assert result["allowed"] is False
+        assert result["reason"] == "premium_only"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# consume_access — списание использования
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestConsumeAccess:
+    """Тесты списания запросов."""
+
+    @pytest.mark.asyncio
+    async def test_consume_from_balance(self, mock_db, mock_cache):
+        """Списывает 1 запрос из пакета."""
+        mock_db.fetchrow.return_value = {"requests_balance": 5}
+        
+        await consume_access(user_id=1, via="balance")
+        
+        # Проверяем, что выполнился UPDATE с уменьшением баланса
+        mock_db.execute.assert_called_once()
+        call_args = mock_db.execute.call_args[0]
+        assert "requests_balance = requests_balance - 1" in call_args[0]
+
+    @pytest.mark.asyncio
+    async def test_consume_from_free_limit(self, mock_db, mock_cache):
+        """Увеличивает счётчик дневных запросов."""
+        await consume_access(user_id=1, via="free_limit")
+        
+        mock_db.execute.assert_called_once()
+        call_args = mock_db.execute.call_args[0]
+        assert "daily_requests_used = COALESCE(daily_requests_used, 0) + 1" in call_args[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# get_remaining_free — остаток бесплатных запросов
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGetRemainingFree:
+    """Тесты подсчёта оставшихся бесплатных запросов."""
+
+    @pytest.mark.asyncio
+    async def test_new_user_has_full_limit(self, mock_db, mock_cache):
+        """Новый пользователь — полный лимит."""
+        mock_db.fetchrow.return_value = {"daily_requests_used": 0}
+        
+        result = await get_remaining_free(user_id=1)
+        
+        assert result == FREE_DAILY_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_user_with_partial_usage(self, mock_db, mock_cache):
+        """Использовано 2 из 5 — осталось 3."""
+        mock_db.fetchrow.return_value = {"daily_requests_used": 2}
+        
+        result = await get_remaining_free(user_id=1)
+        
+        assert result == FREE_DAILY_LIMIT - 2
+
+    @pytest.mark.asyncio
+    async def test_user_at_limit(self, mock_db, mock_cache):
+        """Использовано все 5 — осталось 0."""
+        mock_db.fetchrow.return_value = {"daily_requests_used": FREE_DAILY_LIMIT}
+        
+        result = await get_remaining_free(user_id=1)
+        
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_user_over_limit(self, mock_db, mock_cache):
+        """Использовано больше лимита (аномалия) — всё равно 0."""
+        mock_db.fetchrow.return_value = {"daily_requests_used": 100}
+        
+        result = await get_remaining_free(user_id=1)
+        
+        assert result == 0

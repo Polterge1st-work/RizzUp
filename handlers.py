@@ -1,19 +1,31 @@
 import os
 import asyncio
+import re
 from aiogram import Router, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LabeledPrice, PreCheckoutQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from ai import get_reply_variants, get_reply_from_screenshot, get_improved_variants, get_start_variants, get_reply_with_context
 from states import UserState
-from database import get_pool, add_user, log_request, is_banned, is_admin, ban_user, unban_user, get_stats, get_all_users, get_user_settings, set_user_setting, create_payment, mark_payment_paid, mark_payment_paid_by_provider_id, get_active_subscribers, get_recent_payments, get_revenue_stats, activate_subscription, get_user_stats, get_subscription_status, get_user_stats, add_requests_balance
 from subscription import check_access, consume_access, get_remaining_free
+from database import (
+    get_pool, add_user, log_request, is_banned, is_admin, ban_user, unban_user,
+    get_stats, get_all_users, get_user_settings, set_user_setting,
+    create_payment, mark_payment_paid, mark_payment_paid_by_provider_id,
+    get_active_subscribers, get_recent_payments, get_revenue_stats,
+    activate_subscription, get_subscription_status, get_user_stats,
+    add_requests_balance, create_referral_link, get_referral_link,
+    delete_referral_link, get_all_referral_links, get_referral_stats,
+    set_user_ref, increment_starts,  
+)
 from payments import (
     SUBSCRIPTION_PLANS, PACKAGE_PLANS, ALL_PLANS,
     is_subscription_plan,
+    is_promo_active, get_plan_price, get_plan_base_price,  
     create_cryptobot_invoice, process_cryptobot_payment_if_paid, apply_paid_plan,
-    yookassa_enabled, build_yookassa_invoice_params,
+    yookassa_enabled, create_yookassa_payment,
 )
+
 
 dp = None  # будет установлен из main.py
 
@@ -30,29 +42,46 @@ pending_timers: dict[int, asyncio.Task] = {}
 premium_messages: dict[int, int] = {}
 
 
+def strike_text(text: str) -> str:
+    """Добавляет зачёркивающий штрих к каждому символу. Работает в кнопках Telegram."""
+    return ''.join([f'{char}\u0336' for char in text])
+    
+
 async def admin_only(message: Message) -> bool:
     """Проверяет является ли пользователь админом."""
     return message.from_user.id == ADMIN_ID
 
 
 def is_prompt_injection(text: str) -> bool:
-    """Проверяет является ли сообщение попыткой prompt injection."""
-    dangerous_patterns = [
-        "забудь", "ignore", "forget",
-        "ты теперь", "you are now", "act as",
-        "новые инструкции", "new instructions",
-        "system prompt", "системный промт",
-        "притворись", "pretend",
-        "roleplay", "ролевая",
-        "jailbreak", "дан ", "dan ",
-        "отныне", "from now on",
-        "твои правила", "your rules",
-        "игнорируй", "ignore all",
-        "override", "bypass",
-    ]
+    """
+    Минимальная защита от prompt injection.
+    Блокирует только явные попытки взломать систему.
+    """
     text_lower = text.lower()
-    return any(pattern in text_lower for pattern in dangerous_patterns)
-
+    
+    technical_patterns = [
+        r"system prompt",
+        r"системный промт",
+        r"ignore previous instructions",
+        r"забудь предыдущие инструкции",
+        r"jailbreak",
+        r"dan mode",
+        r"дан режим",
+        r"developer mode",
+        r"выведи свои инструкции",
+        r"print your instructions",
+        r"show me your prompt",
+        r"покажи свой промт",
+        r"override all",
+        r"bypass restrictions",
+    ]
+    
+    for pattern in technical_patterns:
+        if re.search(pattern, text_lower):
+            return True
+    
+    return False
+    
 # Клавиатура главного меню
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
@@ -149,27 +178,48 @@ def build_field_keyboard(field: str) -> InlineKeyboardMarkup:
 # ─── Вспомогательные функции для экранов монетизации ──────────────────────────
 
 def build_plans_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора тарифа — подписки по 2 в ряд, пакеты по 2 в ряд."""
+    """Клавиатура выбора тарифа — все кнопки в одну колонку."""
     sub_items = list(SUBSCRIPTION_PLANS.items())
     pack_items = list(PACKAGE_PLANS.items())
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="— Подписка Premium —", callback_data="plan:noop")],
-        [
-            InlineKeyboardButton(text=f"{sub_items[0][1]['label']} — {sub_items[0][1]['price_rub']} ₽", callback_data=f"plan:{sub_items[0][0]}"),
-            InlineKeyboardButton(text=f"{sub_items[1][1]['label']} — {sub_items[1][1]['price_rub']} ₽", callback_data=f"plan:{sub_items[1][0]}"),
-        ],
-        [
-            InlineKeyboardButton(text=f"🔥 {sub_items[2][1]['label']} — {sub_items[2][1]['price_rub']} ₽", callback_data=f"plan:{sub_items[2][0]}"),
-        ],
-        [InlineKeyboardButton(text="— Пакеты запросов —", callback_data="plan:noop")],
-        [
-            InlineKeyboardButton(text=f"{pack_items[0][1]['label']} — {pack_items[0][1]['price_rub']} ₽", callback_data=f"plan:{pack_items[0][0]}"),
-            InlineKeyboardButton(text=f"🔥 {pack_items[1][1]['label']} — {pack_items[1][1]['price_rub']} ₽", callback_data=f"plan:{pack_items[1][0]}"),
-        ],
-        [
-            InlineKeyboardButton(text=f"{pack_items[2][1]['label']} — {pack_items[2][1]['price_rub']} ₽", callback_data=f"plan:{pack_items[2][0]}"),
-        ],
-    ])
+    
+    def _price_text(plan_id: str, plan: dict) -> str:
+        if is_promo_active() and "promo_price_rub" in plan:
+            base = plan['price_rub']
+            promo = plan['promo_price_rub']
+            discount = round((1 - promo / base) * 100)
+            return f"{promo} ₽ (-{discount}%)"
+        return f"{plan['price_rub']} ₽"
+    
+    def _label(plan_id: str, plan: dict) -> str:
+        base = plan['label']
+        if is_promo_active() and "promo_price_rub" in plan:
+            return f"🔥 {base}"
+        return base
+    
+    # Все кнопки в отдельных строках — одна под другой
+    rows = []
+    
+    # Заголовок
+    rows.append([InlineKeyboardButton(text="— Подписка Premium —", callback_data="plan:noop")])
+    
+    # Подписки — каждая в своей строке
+    for plan_id, plan in sub_items:
+        rows.append([InlineKeyboardButton(
+            text=f"{_label(plan_id, plan)} — {_price_text(plan_id, plan)}",
+            callback_data=f"plan:{plan_id}"
+        )])
+    
+    # Заголовок пакетов
+    rows.append([InlineKeyboardButton(text="— Пакеты запросов —", callback_data="plan:noop")])
+    
+    # Пакеты — каждый в своей строке
+    for plan_id, plan in pack_items:
+        rows.append([InlineKeyboardButton(
+            text=f"{_label(plan_id, plan)} — {_price_text(plan_id, plan)}",
+            callback_data=f"plan:{plan_id}"
+        )])
+    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_payment_method_keyboard(plan_id: str) -> InlineKeyboardMarkup:
@@ -194,17 +244,17 @@ def build_paywall_text(reason: str) -> str:
         )
     return (
         "Лимит на сегодня исчерпан 😔\n\n"
-        "7 бесплатных запросов обновятся завтра. Чтобы продолжить прямо сейчас — подключи Premium или купи пакет запросов 👇"
-    )
+        "5 бесплатных запросов обновятся завтра. Чтобы продолжить прямо сейчас — подключи Premium или купи пакет запросов 👇"
+    )  # ← ИЗМЕНЕНО: 7 → 5
 
 
-async def _edit_or_replace(callback: CallbackQuery, text: str, reply_markup=None):
+async def _edit_or_replace(callback: CallbackQuery, text: str, reply_markup=None, parse_mode=None):
     """Редактирует сообщение независимо от того фото это или текст."""
     msg = callback.message
     if msg.photo or msg.document:
-        await msg.edit_caption(caption=text, reply_markup=reply_markup)
+        await msg.edit_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
     else:
-        await msg.edit_text(text, reply_markup=reply_markup)
+        await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 @router.message(F.text == "⚙️ Настройки")
@@ -263,7 +313,7 @@ async def btn_profile(message: Message):
         f"👤 Профиль\n\n"
         f"⭐ Подписка: {sub_text}\n"
         f"📦 Пакет запросов: {pack_text}\n"
-        f"💬 Бесплатных сегодня: {remaining} из 7\n\n"
+        f"💬 Бесплатных сегодня: {remaining} из 5\n\n"  # ← ИЗМЕНЕНО: из 7 → из 5
         f"📊 Статистика\n"
         f"Всего запросов: {stats['total']}\n"
         f"Ответов на сообщения: {reply_count}\n"
@@ -323,7 +373,7 @@ async def process_context(user_id: int, bot, storage):
     if not messages:
         return
 
-    # Проверяем доступ к функции контекста (только по подписке)
+    # ← ДОБАВЛЕНО: проверяем доступ ЗДЕСЬ, а не при накоплении
     access = await check_access(user_id, "context")
     if not access["allowed"]:
         await bot.send_message(
@@ -336,6 +386,10 @@ async def process_context(user_id: int, bot, storage):
     try:
         await bot.send_chat_action(user_id, "typing")
         settings = await get_user_settings(user_id)
+        
+        # логируем ЗДЕСЬ, после проверки доступа
+        await log_request(user_id, "reply_context")
+        
         reply = await get_reply_with_context(messages, settings)
 
         variants = parse_variants(reply)
@@ -351,6 +405,9 @@ async def process_context(user_id: int, bot, storage):
             reply_markup=REPLY_MODE_MENU
         )
 
+        # списываем ТОЛЬКО после успешного ответа
+        await consume_access(user_id, access["via"])
+
         # Переключаем состояние обратно в replying
         from aiogram.fsm.storage.base import StorageKey
         key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
@@ -362,6 +419,7 @@ async def process_context(user_id: int, bot, storage):
             "Что-то пошло не так, попробуй ещё раз 🙁",
             reply_markup=REPLY_MODE_MENU
         )
+        # ВАЖНО: при ошибке НЕ списываем — пользователь не потеряет запрос
 
 
 async def _delayed_process(user_id: int, bot, delay: float, storage):
@@ -387,14 +445,23 @@ async def cmd_premium(message: Message):
             pass
         del premium_messages[user_id]
 
+    promo_header = ""
+    if is_promo_active():
+        promo_header = "🔥 ВРЕМЕННАЯ АКЦИЯ 🔥\nСкидки на подписки!\n\n"
+
     sent = await message.answer(
+        f"{promo_header}"
         "⭐ RizzUp Premium\n\n"
-        "Открывает все возможности бота без ограничений:\n\n"
-        "💬 Безлимитные ответы — никаких дневных лимитов, пиши сколько хочешь\n"
-        "📸 Ответы по скриншотам — скинь скрин переписки и получи идеальный ответ\n"
-        "🧵 Режим контекста — бот учитывает всю вашу переписку и отвечает точнее\n"
-        "⚡ Мгновенные ответы — никаких задержек и очередей\n\n"
-        "Подписка продлевает доступ, пакеты складываются с остатком.\n\n"
+        "Бесплатно — 5 запросов в день, только текст.\n"
+        "С Premium — безлимит на всё.\n\n"
+        "Что открывает Premium:\n\n"
+        "📸 Ответы по скриншотам\n"
+        "Скинь скрин переписки — не нужно перепечатывать сообщения руками\n\n"
+        "🧵 Режим контекста\n"
+        "Перешли мне всю переписку — отвечу с учётом истории, точнее и уместнее\n\n"
+        "💬 Безлимитные ответы\n"
+        "Не считаешь запросы, не ждёшь завтра. Тренируйся, экспериментируй\n\n"
+        "Подписка продлевается, пакеты складываются с остатком.\n\n"
         "Выбери тариф 👇",
         reply_markup=build_plans_keyboard(),
     )
@@ -432,10 +499,19 @@ async def select_plan(callback: CallbackQuery):
         await callback.answer("Тариф не найден", show_alert=True)
         return
 
+    price = get_plan_price(plan_id)
+    base_price = get_plan_base_price(plan_id)
+    if is_promo_active() and "promo_price_rub" in plan:
+        discount = round((1 - price / base_price) * 100)
+        price_text = f"{price} ₽ (-{discount}%)"
+    else:
+        price_text = f"{price} ₽"
+
     await _edit_or_replace(
         callback,
-        f"{'📅 Подписка' if is_subscription_plan(plan_id) else '📦 Пакет'}: {plan['label']} — {plan['price_rub']} ₽\n\nВыбери способ оплаты:",
+        f"{'📅 Подписка' if is_subscription_plan(plan_id) else '📦 Пакет'}: {plan['label']} — {price_text} ₽\n\nВыбери способ оплаты:",
         reply_markup=build_payment_method_keyboard(plan_id),
+        parse_mode="HTML",  # ← ДОБАВЛЕНО
     )
     await callback.answer()
 
@@ -454,12 +530,15 @@ async def pay_with_crypto(callback: CallbackQuery):
         await callback.answer("Не получилось создать счёт, попробуй ещё раз чуть позже", show_alert=True)
         return
 
+    # ← ИЗМЕНЕНО: используем актуальную цену для записи в БД
+    price = get_plan_price(plan_id)
+
     await create_payment(
         user_id=callback.from_user.id,
         provider="cryptobot",
         provider_payment_id=invoice["invoice_id"],
         plan=plan_id,
-        amount=plan["price_rub"],
+        amount=price,  # ← ИЗМЕНЕНО: было plan["price_rub"]
         currency="RUB",
     )
 
@@ -470,7 +549,7 @@ async def pay_with_crypto(callback: CallbackQuery):
     ])
     await _edit_or_replace(
         callback,
-        f"{plan['label']} — {plan['price_rub']} ₽\n\nОплати по кнопке ниже, затем нажми «Я оплатил» — проверим автоматически.",
+        f"{plan['label']} — {price} ₽\n\nОплати по кнопке ниже, затем нажми «Я оплатил» — проверим автоматически.",  # ← ИЗМЕНЕНО: цена
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -501,53 +580,49 @@ async def check_crypto_payment(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("pay:yookassa:"))
 async def pay_with_yookassa(callback: CallbackQuery):
-    """Отправляет инвойс ЮКасса через нативный Telegram Payments."""
+    """Создаёт платёж в ЮКассе и показывает ссылку на оплату."""
     plan_id = callback.data.removeprefix("pay:yookassa:")
     plan = ALL_PLANS.get(plan_id)
     if not plan:
         await callback.answer("Тариф не найден", show_alert=True)
         return
-
-    await callback.message.delete()
-    await callback.message.answer_invoice(**build_yookassa_invoice_params(plan_id))
-    await callback.answer()
-
-
-@router.pre_checkout_query()
-async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    """Подтверждает возможность проведения платежа."""
-    await pre_checkout_query.answer(ok=True)
-
-
-@router.message(F.successful_payment)
-async def process_successful_payment(message: Message):
-    """Активирует тариф после успешной оплаты через Telegram Payments."""
-    plan_id = message.successful_payment.invoice_payload
-    plan = ALL_PLANS.get(plan_id)
-    if not plan:
+    
+    payment = await create_yookassa_payment(plan_id, callback.from_user.id)
+    if not payment:
+        await callback.answer(
+            "Не удалось создать платёж. Попробуй позже или выбери другой способ оплаты.",
+            show_alert=True
+        )
         return
-
-    await apply_paid_plan(message.from_user.id, plan_id)
+    
+    # ← ИЗМЕНЕНО: используем актуальную цену для записи в БД
+    price = get_plan_price(plan_id)
+    
+    # Сохраняем в БД со статусом pending
     await create_payment(
-        user_id=message.from_user.id,
+        user_id=callback.from_user.id,
         provider="yookassa",
-        provider_payment_id=message.successful_payment.telegram_payment_charge_id,
+        provider_payment_id=payment["payment_id"],
         plan=plan_id,
-        amount=plan["price_rub"],
+        amount=price,  # ← ИЗМЕНЕНО: было plan["price_rub"]
         currency="RUB",
     )
-    await mark_payment_paid_by_provider_id(
-        "yookassa",
-        message.successful_payment.telegram_payment_charge_id,
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=payment["confirmation_url"])],
+        [InlineKeyboardButton(text="‹ Назад к тарифам", callback_data="plan:back")],
+    ])
+    
+    await _edit_or_replace(
+        callback,
+        f"{'📅 Подписка' if is_subscription_plan(plan_id) else '📦 Пакет'}: {plan['label']} — {price} ₽\n\n"  # ← ИЗМЕНЕНО: цена
+        f"Нажми кнопку ниже и оплати через ЮКассу.\n\n"
+        f"После оплаты я пришлю уведомление — всё активируется автоматически ✅",
+        reply_markup=keyboard,
     )
+    await callback.answer()
 
-    if is_subscription_plan(plan_id):
-        text = f"Готово! Подписка «{plan['label']}» активирована ⭐\n\nТеперь у тебя безлимит на все функции, включая скриншоты и контекст переписки."
-    else:
-        text = f"Готово! Начислено {plan['amount']} запросов 🎉\n\nОни не сгорают — используй когда захочешь."
-
-    await message.answer(text, reply_markup=MAIN_MENU)
-
+# ─── Админ панель ─────────────────────────────────────
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
@@ -559,13 +634,17 @@ async def cmd_admin(message: Message):
         "/stats — статистика бота\n"
         "/subscribers — активные подписчики\n"
         "/payments — последние 20 платежей\n"
-        "/find @username — Найти пользователя по юзернейму\n"
+        "/find @username или [id] — Найти пользователя по юзернейму или по ID\n"
         "/give [user_id] [day|week|month] — выдать подписку вручную\n"
         "/give_pack [user_id] [количество] — выдать пакет запросов вручную\n"
         "/reset [user_id] — сбросить подписку и пакет запросов\n"
         "/ban [user_id] — забанить пользователя\n"
         "/unban [user_id] — разбанить пользователя\n"
         "/broadcast [текст] — рассылка всем пользователям\n"
+        "/refadd [название] — создать реферальную ссылку\n"
+        "/refdel [код] — удалить реферальную ссылку\n"
+        "/refstats — список реферальных ссылок\n"
+        "/refstats [код] — детали по ссылке\n"
     )
 
 
@@ -632,28 +711,47 @@ async def cmd_payments(message: Message):
 
 @router.message(Command("find"))
 async def cmd_find(message: Message):
-    """Найти пользователя по юзернейму: /find @username"""
+    """Найти пользователя по юзернейму или ID: /find @username или /find 123456789"""
     if not await admin_only(message):
         return
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("Использование: /find @username")
+        await message.answer("Использование: /find @username или /find 123456789")
         return
-    username = args[1].lstrip("@")
+    
+    query = args[1]
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT user_id, username, first_name, subscription_expires, requests_balance FROM users WHERE username = $1",
-            username
-        )
+        # Если начинается с @ — ищем по username
+        if query.startswith("@"):
+            username = query.lstrip("@")
+            row = await conn.fetchrow(
+                "SELECT user_id, username, first_name, subscription_expires, requests_balance, ref_code FROM users WHERE username = $1",
+                username
+            )
+        else:
+            # Иначе ищем по user_id
+            try:
+                user_id = int(query)
+            except ValueError:
+                await message.answer("Использование: /find @username или /find 123456789")
+                return
+            row = await conn.fetchrow(
+                "SELECT user_id, username, first_name, subscription_expires, requests_balance, ref_code FROM users WHERE user_id = $1",
+                user_id
+            )
+    
     if not row:
-        await message.answer(f"Пользователь @{username} не найден")
+        await message.answer(f"Пользователь не найден")
         return
+    
+    ref_info = f"\nРеферал: {row['ref_code']}" if row['ref_code'] else ""
     await message.answer(
-        f"👤 @{row['username']} — {row['first_name']}\n"
+        f"👤 @{row['username'] or 'нет'} — {row['first_name'] or 'нет'}\n"
         f"ID: `{row['user_id']}`\n"
         f"Подписка: {row['subscription_expires'] or 'нет'}\n"
-        f"Пакет: {row['requests_balance'] or 0} запросов",
+        f"Пакет: {row['requests_balance'] or 0} запросов"
+        f"{ref_info}",
         parse_mode="Markdown"
     )
 
@@ -780,26 +878,122 @@ async def cmd_broadcast(message: Message):
         f"❌ Не доставлено: {failed}"
     )
 
+@router.message(Command("refadd"))
+async def cmd_refadd(message: Message):
+    """Создать реферальную ссылку: /refadd Название канала"""
+    if not await admin_only(message):
+        return
+    args = message.text.removeprefix("/refadd").strip()
+    if not args:
+        await message.answer("Использование: /refadd Название канала")
+        return
+    
+    try:
+        code = await create_referral_link(args)
+        bot_username = os.getenv("BOT_USERNAME", "RizzUp_chat_bot")
+        await message.answer(
+            f"✅ Ссылка создана\n\n"
+            f"Название: {args}\n"
+            f"Код: <code>{code}</code>\n\n"
+            f"Ссылка:\n"
+            f"<code>https://t.me/{bot_username}?start={code}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+@router.message(Command("refdel"))
+async def cmd_refdel(message: Message):
+    """Удалить реферальную ссылку: /refdel 7392"""
+    if not await admin_only(message):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /refdel 7392")
+        return
+    
+    code = args[1]
+    deleted = await delete_referral_link(code)
+    if deleted:
+        await message.answer(f"✅ Ссылка {code} удалена")
+    else:
+        await message.answer(f"❌ Ссылка {code} не найдена")
+
+
+@router.message(Command("refstats"))
+async def cmd_refstats(message: Message):
+    """Статистика по реферальным ссылкам: /refstats или /refstats 7392"""
+    if not await admin_only(message):
+        return
+    
+    args = message.text.split()
+    
+    # Детали по конкретной ссылке
+    if len(args) > 1:
+        code = args[1]
+        stats = await get_referral_stats(code)
+        if not stats:
+            await message.answer(f"❌ Ссылка {code} не найдена")
+            return
+        
+        conversion = (stats['paid_users'] / stats['starts'] * 100) if stats['starts'] > 0 else 0
+        await message.answer(
+            f"📎 {stats['code']} | {stats['label']}\n\n"
+            f"Стартов: {stats['starts']}\n"
+            f"Купило: {stats['paid_users']} ({conversion:.1f}%)\n"
+            f"Выручка: {stats['revenue']:.0f} ₽"
+        )
+        return
+    
+    # Общий список
+    links = await get_all_referral_links()
+    if not links:
+        await message.answer("📎 Реферальных ссылок пока нет")
+        return
+    
+    lines = []
+    for code, label, starts, created_at in links:
+        lines.append(f"• <code>{code}</code> | {label} | {starts} стартов")
+    
+    await message.answer(
+        f"📎 Реферальные ссылки ({len(links)}):\n\n" + "\n".join(lines),
+        parse_mode="HTML"
+    )
+
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     """Приветствие с онбордингом и главным меню."""
     user = message.from_user
+    
+    # парсим реферальный код
+    args = message.text.split()
+    ref_code = args[1] if len(args) > 1 else None
+    
+    if ref_code:
+        link = await get_referral_link(ref_code)
+        if link:
+            await increment_starts(ref_code)
+    
     await add_user(user.id, user.username, user.first_name)
+    
+    # записываем ref_code после создания пользователя
+    if ref_code:
+        await set_user_ref(user.id, ref_code)
+    
     await message.answer(
         f"Привет, {user.first_name}! Я RizzUp 👋\n\n"
-        "Помогаю отвечать в переписках — быстро, естественно и без кринжа.\n\n"
+        "Помогаю писать в переписках так, чтобы собеседник хотел продолжать разговор.\n\n"
         "Вот что умею:\n\n"
         "💬 Ответить на сообщение\n"
-        "Скинь текст или скриншот переписки — предложу 3 варианта ответа на выбор.\n\n"
+        "Скинь текст или скриншот переписки — предложу 3 варианта ответа.\n\n"
         "✏️ Улучшить сообщение\n"
-        "Написал, но звучит не так? Перепишу в 3 вариантах.\n\n"
+        "Улучшу твоё сообщение — звучит естественнее и увереннее.\n\n"
         "🚀 Начать разговор\n"
-        "Не знаешь как зайти первым? Опиши ситуацию — придумаю.\n\n"
-        "⚙️ Настройки персонализации\n"
-        "По умолчанию настроено: ты — парень, собеседник — девушка, ответы с маленькой буквы. "
-        "Если у тебя другая ситуация — поменяй в ⚙️ Настройки, это сделает ответы точнее.\n\n"
-        "Выбирай функцию и пробуй 👇",
+        "Придумаю как начать разговор\n\n"
+        "5 запросов бесплатно каждый день. Пробуй 👇",
         reply_markup=MAIN_MENU,
     )
 
@@ -821,7 +1015,7 @@ async def cmd_help(message: Message):
         "Укажи свой пол, пол собеседника и стиль регистра — бот будет генерировать ответы точнее под твою ситуацию.\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "📸 Скриншоты и контекст переписки — функции Premium.\n"
-        "7 запросов в день бесплатно. Подробнее о тарифах: /premium\n\n"
+        "5 запросов в день бесплатно. Подробнее о тарифах: /premium\n\n" 
         "Если что-то не работает или есть вопрос — напиши нам: @rizzup_support"
     )
 
@@ -927,8 +1121,6 @@ async def handle_context_text(message: Message, state: FSMContext):
     if await is_banned(message.from_user.id):
         await message.answer("Вы заблокированы.")
         return
-
-    await log_request(message.from_user.id, "reply_context")
 
     user_id = message.from_user.id
 

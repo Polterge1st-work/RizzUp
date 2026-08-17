@@ -3,7 +3,7 @@
 """
 from database import get_pool, get_subscription_status, spend_request_from_balance
 
-FREE_DAILY_LIMIT = 7
+FREE_DAILY_LIMIT = 5
 
 
 async def _reset_daily_if_needed(user_id: int):

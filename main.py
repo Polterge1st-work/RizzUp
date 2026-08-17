@@ -2,7 +2,9 @@ import asyncio
 import logging
 import sys
 import os
+import json
 from dotenv import load_dotenv
+from aiohttp import web
 
 load_dotenv()
 
@@ -12,10 +14,10 @@ from aiogram.types import BotCommand
 import handlers
 from handlers import router
 from database import init_db, add_user, set_admin, get_pool
+from payments import process_yookassa_webhook, yookassa_enabled
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Настройка логирования (systemd собирает stdout/stderr)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -58,31 +60,74 @@ async def daily_cleanup():
             logger.exception(f"Ошибка в daily_cleanup: {e}")
 
 
+# --- Webhook-сервер ЮКасса -------------------------------------------------
+
+async def yookassa_webhook_handler(request: web.Request) -> web.Response:
+    """Обрабатывает incoming webhook от ЮКассы."""
+    body = await request.read()
+    
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        logger.warning("YooKassa webhook: невалидный JSON")
+        return web.Response(status=400)
+    
+    # Получаем bot из app context
+    bot = request.app.get("bot")
+    if not bot:
+        logger.error("YooKassa webhook: bot не найден в app context")
+        return web.Response(status=500)
+    
+    success = await process_yookassa_webhook(data, bot)
+    return web.Response(status=200 if success else 400)
+
+
+async def run_webhook_server(bot: Bot):
+    """Запускает aiohttp-сервер для webhook ЮКассы."""
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post("/yookassa/webhook", yookassa_webhook_handler)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    
+    logger.info("Webhook-сервер ЮКасса запущен на порту 8080")
+    
+    # Держим сервер живым
+    while True:
+        await asyncio.sleep(3600)
+
+
 async def main():
     """Точка входа приложения."""
     bot, dp = await setup_bot()
 
+    tasks = [dp.start_polling(bot), daily_cleanup()]
+    
+    # Добавляем webhook-сервер если ЮКасса настроена
+    if yookassa_enabled():
+        tasks.append(run_webhook_server(bot))
+        logger.info("ЮКасса webhook включён")
+    else:
+        logger.info("ЮКасса не настроена, webhook-сервер не запущен")
+    
     try:
-        logger.info("RizzUp запущен. Начинаем polling...")
-        await asyncio.gather(
-            dp.start_polling(bot),
-            daily_cleanup()
-        )
+        await asyncio.gather(*tasks)
     except Exception as e:
         logger.exception(f"Критическая ошибка: {e}")
         raise
     finally:
-        # Гарантированное закрытие всех ресурсов
         logger.info("Закрытие сессии бота...")
         await bot.session.close()
-
-        # Закрытие пула PostgreSQL если он инициализирован
+        
         try:
             pool = await get_pool()
             await pool.close()
             logger.info("Пул БД закрыт")
         except RuntimeError:
-            # БД не была инициализирована — нормально
             pass
 
 

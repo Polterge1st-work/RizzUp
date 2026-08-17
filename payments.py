@@ -3,9 +3,8 @@
 """
 import os
 import uuid
+import base64
 import aiohttp
-import json
-from aiogram.types import LabeledPrice, InlineKeyboardMarkup, InlineKeyboardButton
 from database import (
     create_payment, mark_payment_paid,
     mark_payment_paid_by_provider_id, is_payment_already_paid,
@@ -15,27 +14,87 @@ from database import (
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
 CRYPTO_BOT_API = "https://pay.crypt.bot/api"
 
-YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN")
+# ─── ЮКасса прямое API ───────────────────────────────────────────────────────
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+YOOKASSA_API = "https://api.yookassa.ru/v3"
 
-# Тарифы — единый источник правды для всего кода
+# ═══════════════════════════════════════════════════════════════════════════════
+# ТАРИФЫ — единый источник правды
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Временная акция: скидки на подписки (пакеты без скидки)
+# Включить/выключить через переменную окружения PROMO_ACTIVE
+PROMO_ACTIVE = os.getenv("PROMO_ACTIVE", "false").lower() == "true"
+
 SUBSCRIPTION_PLANS = {
-    "sub_day":   {"label": "3 дня",  "days": 3,  "price_rub": 109},
-    "sub_week":  {"label": "Неделя", "days": 7,  "price_rub": 169},
-    "sub_month": {"label": "Месяц",  "days": 30, "price_rub": 279},
+    "sub_day":   {
+        "label": "3 дня",
+        "days": 3,
+        "price_rub": 99,
+        "promo_price_rub": 49,   # −50%
+    },
+    "sub_week":  {
+        "label": "Неделя",
+        "days": 7,
+        "price_rub": 149,
+        "promo_price_rub": 109,  # −27%
+    },
+    "sub_month": {
+        "label": "Месяц",
+        "days": 30,
+        "price_rub": 249,
+        "promo_price_rub": 219,  # −12%
+    },
 }
 
 PACKAGE_PLANS = {
-    "pack_30":  {"label": "50 запросов",  "amount": 70,  "price_rub": 119},
-    "pack_100": {"label": "150 запросов", "amount": 150, "price_rub": 179},
-    "pack_250": {"label": "250 запросов", "amount": 250, "price_rub": 229},
+    "pack_s": {
+        "label": "30 запросов",
+        "amount": 30,
+        "price_rub": 49,
+    },
+    "pack_m": {
+        "label": "70 запросов",
+        "amount": 70,
+        "price_rub": 89,
+    },
+    "pack_l": {
+        "label": "120 запросов",
+        "amount": 120,
+        "price_rub": 139,
+    },
 }
 
 ALL_PLANS = {**SUBSCRIPTION_PLANS, **PACKAGE_PLANS}
 
 
+def get_plan_price(plan_id: str) -> int:
+    """Возвращает актуальную цену тарифа с учётом акции."""
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        return 0
+    
+    if PROMO_ACTIVE and "promo_price_rub" in plan:
+        return plan["promo_price_rub"]
+    
+    return plan["price_rub"]
+
+
+def get_plan_base_price(plan_id: str) -> int:
+    """Возвращает базовую (неакционную) цену."""
+    plan = ALL_PLANS.get(plan_id)
+    return plan["price_rub"] if plan else 0
+
+
 def is_subscription_plan(plan_id: str) -> bool:
     """Является ли тариф подпиской (а не пакетом запросов)."""
     return plan_id in SUBSCRIPTION_PLANS
+
+
+def is_promo_active() -> bool:
+    """Активна ли временная акция."""
+    return PROMO_ACTIVE
 
 
 async def apply_paid_plan(user_id: int, plan_id: str):
@@ -52,14 +111,20 @@ async def create_cryptobot_invoice(plan_id: str) -> dict | None:
     """Создаёт инвойс в CryptoBot. Возвращает {"invoice_id": str, "pay_url": str} или None."""
     if not CRYPTO_BOT_TOKEN:
         return None
-    plan = ALL_PLANS[plan_id]
+    
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        return None
+    
+    price = get_plan_price(plan_id)
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
                 f"{CRYPTO_BOT_API}/createInvoice",
                 headers={"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN},
                 json={
-                    "amount": str(plan["price_rub"]),
+                    "amount": str(price),
                     "currency_type": "fiat",
                     "fiat": "RUB",
                     "accepted_assets": "USDT,TON",
@@ -82,6 +147,7 @@ async def process_cryptobot_payment_if_paid(user_id: int, plan_id: str, invoice_
         return True
     if not CRYPTO_BOT_TOKEN:
         return False
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(
@@ -97,62 +163,179 @@ async def process_cryptobot_payment_if_paid(user_id: int, plan_id: str, invoice_
                     return False
         except Exception:
             return False
+    
     await mark_payment_paid_by_provider_id("cryptobot", invoice_id)
     await apply_paid_plan(user_id, plan_id)
     return True
 
 
-# ─── ЮКасса ───────────────────────────────────────────────────────────────────
+# ─── ЮКасса прямое API ───────────────────────────────────────────────────────
+
 
 def yookassa_enabled() -> bool:
-    return bool(YOOKASSA_PROVIDER_TOKEN)
+    """Проверяет настроена ли ЮКасса."""
+    return bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
 
 
-def build_yookassa_invoice_params(plan_id: str) -> dict:
-    """Параметры для answer_invoice() при оплате через ЮКасса."""
-    plan = ALL_PLANS[plan_id]
+def _yookassa_auth() -> str:
+    """Base64 auth для ЮКасса API."""
+    return base64.b64encode(
+        f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode()
+    ).decode()
+
+
+async def create_yookassa_payment(plan_id: str, user_id: int) -> dict | None:
+    """
+    Создаёт платёж в ЮКассе. Возвращает {payment_id, confirmation_url}.
+    """
+    if not yookassa_enabled():
+        return None
     
-    # Флаг для динамического определения типа товара
-    is_sub = is_subscription_plan(plan_id)
+    plan = ALL_PLANS.get(plan_id)
+    if not plan:
+        return None
     
+    price = get_plan_price(plan_id)
+    
+    # Формируем чек по 54-ФЗ для ИП на НПД
     receipt_data = {
-        "receipt": {
-            "customer": {
-                # Поля оставлены пустыми, так как ниже мы указали 
-                # Telegram-параметры `send_email_to_provider=True`.
-                # ЮKassa сама автоматически подставит email, введенный юзером.
-            },
-            "items": [
-                {
-                    "description": f"RizzUp — {plan['label']}",
-                    "quantity": "1.00",
-                    "amount": {
-                        "value": f"{plan['price_rub']}.00",
-                        "currency": "RUB"
-                    },
-                    "vat_code": 1,  # 1 — Без НДС (для Самозанятых/ИП на УСН). Если у вас другая ставка, замените.
-                    "payment_mode": "full_prepayment",  # Полная предоплата
-                    "payment_subject": "service" if is_sub else "component"  # service — для подписок, component — для пакетов
-                }
-            ]
-        }
+        "customer": {
+            "email": "placeholder@rizzup.bot"
+        },
+        "items": [
+            {
+                "description": f"RizzUp — {plan['label']}",
+                "quantity": "1.00",
+                "amount": {
+                    "value": f"{price}.00",
+                    "currency": "RUB"
+                },
+                "vat_code": 1,  # Без НДС для НПД
+                "payment_mode": "full_prepayment",
+                "payment_subject": "service" if is_subscription_plan(plan_id) else "commodity"
+            }
+        ]
     }
     
-    return {
-        "title": f"RizzUp — {plan['label']}",
-        "description": "Подписка Premium" if is_sub else "Пакет запросов",
-        "payload": plan_id,
-        "provider_token": YOOKASSA_PROVIDER_TOKEN,
-        "currency": "RUB",
-        "prices": [LabeledPrice(label=plan["label"], amount=plan["price_rub"] * 100)],
-        "need_email": True,
-        "send_email_to_provider": True,
-        "provider_data": json.dumps(receipt_data),  # Теперь здесь валидный корневой словарь
-        "reply_markup": InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"Заплатить {plan['price_rub']} ₽",
-                pay=True,
-                style="success"
-            )]
-        ])
+    payload = {
+        "amount": {
+            "value": f"{price}.00",
+            "currency": "RUB"
+        },
+        "capture": True,
+        "confirmation": {
+            "type": "redirect",
+            "return_url": f"https://t.me/{os.getenv('BOT_USERNAME', 'RizzUp_chat_bot')}"
+        },
+        "description": f"RizzUp — {plan['label']}",
+        "metadata": {
+            "user_id": str(user_id),
+            "plan_id": plan_id
+        },
+        "receipt": receipt_data
     }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{YOOKASSA_API}/payments",
+                headers={
+                    "Authorization": f"Basic {_yookassa_auth()}",
+                    "Idempotence-Key": str(uuid.uuid4()),
+                    "Content-Type": "application/json"
+                },
+                json=payload
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    print(f"[YooKassa] Ошибка создания: {resp.status} {error}")
+                    return None
+                
+                data = await resp.json()
+                return {
+                    "payment_id": data["id"],
+                    "confirmation_url": data["confirmation"]["confirmation_url"]
+                }
+    except Exception as e:
+        print(f"[YooKassa] Ошибка: {e}")
+        return None
+
+
+async def check_payment_status_via_api(payment_id: str) -> bool:
+    """
+    Безопасно проверяет реальный статус платежа напрямую через API ЮKassa.
+    Исключает подделку вебхуков без необходимости сложной валидации сертификатов.
+    """
+    if not yookassa_enabled():
+        return False
+        
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{YOOKASSA_API}/payments/{payment_id}",
+                headers={
+                    "Authorization": f"Basic {_yookassa_auth()}"
+                }
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+                return data.get("status") == "succeeded"
+    except Exception as e:
+        print(f"[YooKassa] Ошибка проверки платежа {payment_id}: {e}")
+        return False
+
+
+async def process_yookassa_webhook(data: dict, bot) -> bool:
+    """
+    Обрабатывает webhook от ЮКассы.
+    """
+    event = data.get("event")
+    if event not in ("payment.succeeded", "payment.captured"):
+        return False
+    
+    payment_obj = data.get("object", {})
+    payment_id = payment_obj.get("id")
+    
+    if not payment_id:
+        return False
+
+    # 1. ЗАЩИТА: Проверяем статус напрямую у ЮKassa
+    if not await check_payment_status_via_api(payment_id):
+        print(f"[YooKassa] АЛЕРТ: Попытка подделки вебхука для платежа {payment_id}!")
+        return False
+    
+    metadata = payment_obj.get("metadata", {})
+    user_id = int(metadata.get("user_id", 0))
+    plan_id = metadata.get("plan_id")
+    
+    if not user_id or not plan_id:
+        return False
+    
+    # Защита от двойной активации
+    if await is_payment_already_paid("yookassa", payment_id):
+        return True
+    
+    # Активируем тариф
+    await mark_payment_paid_by_provider_id("yookassa", payment_id)
+    await apply_paid_plan(user_id, plan_id)
+    
+    # Уведомляем пользователя
+    try:
+        plan = ALL_PLANS.get(plan_id)
+        
+        if is_subscription_plan(plan_id):
+            text = (
+                f"Готово! Подписка «{plan['label']}» активирована ⭐\n\n"
+                f"Теперь у тебя безлимит на все функции, включая скриншоты и контекст переписки."
+            )
+        else:
+            text = (
+                f"Готово! Начислено {plan['amount']} запросов 🎉\n\n"
+                f"Они не сгорают — используй когда захочешь."
+            )
+        await bot.send_message(user_id, text)
+    except Exception as e:
+        print(f"[YooKassa] Не удалось уведомить пользователя {user_id}: {e}")
+    
+    return True
